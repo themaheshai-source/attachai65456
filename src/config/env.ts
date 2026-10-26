@@ -3,6 +3,7 @@ import path from 'node:path';
 import { loadLlmConfig, type LlmConfig } from './llm.js';
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PIPELINE_DIAGNOSTICS: z.enum(['off', 'basic', 'detailed']).default('basic'),
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().positive().default(3000),
   ADMIN_API_KEY: z.string().min(16).default('local-development-admin-key'),
