@@ -2,11 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ProviderHealth, RetrievedChunk, VectorRecord } from '../domain/types.js';
+import type { ProviderDiagnostic } from '../lib/observability.js';
 export interface VectorProvider {
   readonly name: string;
   upsert(clientId: string, rows: VectorRecord[]): Promise<void>;
   replaceSource(clientId: string, source: string, rows: VectorRecord[]): Promise<void>;
-  search(clientId: string, v: number[], topK: number, min: number): Promise<RetrievedChunk[]>;
+  search(clientId: string, v: number[], topK: number, min: number, diagnostic?: ProviderDiagnostic): Promise<RetrievedChunk[]>;
   /** Bounded tenant-only text corpus used by exact, keyword, and BM25 recall. */
   listTenant(clientId: string, limit?: number): Promise<RetrievedChunk[]>;
   deleteTenant(clientId: string): Promise<void>;
@@ -107,23 +108,24 @@ export class QdrantVector implements VectorProvider {
       throw new Error(`Qdrant source replacement failed (${deleted.status})`);
     await this.upsert(c, r);
   }
-  async search(c: string, v: number[], k: number, min: number) {
+  async search(c: string, v: number[], k: number, min: number, diagnostic?: ProviderDiagnostic) {
+    const started = process.hrtime.bigint();
+    diagnostic?.('VECTOR_SEARCH_STARTED', { provider: this.name, topK: k, minSimilarity: min, vectorDimensions: v.length, tenantScoped: true });
     const r = await fetch(`${this.url}/collections/tenant_knowledge/points/search`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({
-        vector: v,
-        limit: k,
-        score_threshold: min,
-        filter: { must: [{ key: 'clientId', match: { value: c } }] },
-        with_payload: true,
-      }),
+      method: 'POST', headers: this.headers(),
+      body: JSON.stringify({ vector: v, limit: k, score_threshold: min, filter: { must: [{ key: 'clientId', match: { value: c } }] }, with_payload: true }),
     });
+    diagnostic?.('VECTOR_SEARCH_HTTP_RESPONSE', { provider: this.name, httpStatus: r.status, responseOk: r.ok, durationMs: Number(process.hrtime.bigint() - started) / 1_000_000 });
     if (!r.ok) throw new Error(`Qdrant search failed (${r.status})`);
-    const j = (await r.json()) as {
-      result: { id: string | number; score: number; payload: { text: string; source: string } }[];
-    };
-    return j.result.map((x) => ({ id: String(x.id), ...x.payload, score: x.score }));
+    let j: { result: { id: string | number; score: number; payload: { text: string; source: string } }[] };
+    try { j = await r.json() as typeof j; }
+    catch (error) { diagnostic?.('VECTOR_SEARCH_RESPONSE_PARSE_FAILED', { provider: this.name, errorCategory: error instanceof Error ? error.name : 'unknown' }); throw error; }
+    let rows: RetrievedChunk[];
+    try { rows = j.result.map((x) => ({ id: String(x.id), ...x.payload, score: x.score })); }
+    catch (error) { diagnostic?.('VECTOR_SEARCH_RESPONSE_PARSE_FAILED', { provider: this.name, errorCategory: 'invalid_response_shape' }); throw error; }
+    const scores = rows.map((x) => x.score).filter(Number.isFinite).sort((a, b) => a - b);
+    diagnostic?.('VECTOR_SEARCH_PARSED', { provider: this.name, candidateCount: rows.length, scoreMin: scores[0] ?? null, scoreMedian: scores.length ? scores[Math.floor((scores.length - 1) / 2)]! : null, scoreMax: scores.at(-1) ?? null, tenantScoped: true });
+    return rows;
   }
   async listTenant(c: string, limit = 2000) {
     const r = await fetch(`${this.url}/collections/tenant_knowledge/points/scroll`, {
@@ -195,20 +197,21 @@ export class SupabaseVector implements VectorProvider {
     if (de) throw new Error(`pgvector source delete failed: ${de.message}`);
     await this.upsert(clientId, rows);
   }
-  async search(clientId: string, v: number[], topK: number, min: number) {
+  async search(clientId: string, v: number[], topK: number, min: number, diagnostic?: ProviderDiagnostic) {
+    const started = process.hrtime.bigint();
+    diagnostic?.('VECTOR_SEARCH_STARTED', { provider: this.name, topK, minSimilarity: min, vectorDimensions: v.length, tenantScoped: true });
     const { data, error } = await this.client.rpc('match_knowledge_vectors', {
-      query_embedding: this.validate(v),
-      match_client_id: clientId,
-      match_threshold: min,
-      match_count: topK,
+      query_embedding: this.validate(v), match_client_id: clientId, match_threshold: min, match_count: topK,
     });
-    if (error) throw new Error(`pgvector search failed: ${error.message}`);
-    return (data ?? []).map((x: any) => ({
-      id: String(x.id),
-      text: String(x.text ?? x.content),
-      source: String(x.source),
-      score: Number(x.similarity ?? x.score),
-    }));
+    const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    if (error) {
+      diagnostic?.('VECTOR_SEARCH_FAILED', { provider: this.name, durationMs, errorCategory: 'database_rpc_error' });
+      throw new Error(`pgvector search failed: ${error.message}`);
+    }
+    const rows = (data ?? []).map((x: any) => ({ id: String(x.id), text: String(x.text ?? x.content), source: String(x.source), score: Number(x.similarity ?? x.score) }));
+    const scores = rows.map((x: RetrievedChunk) => x.score).filter(Number.isFinite).sort((a: number, b: number) => a - b);
+    diagnostic?.('VECTOR_SEARCH_PARSED', { provider: this.name, durationMs, candidateCount: rows.length, scoreMin: scores[0] ?? null, scoreMedian: scores.length ? scores[Math.floor((scores.length - 1) / 2)]! : null, scoreMax: scores.at(-1) ?? null, tenantScoped: true });
+    return rows;
   }
   async listTenant(clientId: string, limit = 2000) {
     const { data, error } = await this.client
