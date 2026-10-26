@@ -90,17 +90,33 @@ const nav: [Page, string, React.ElementType][] = [
   ['health', 'Health', Activity],
 ];
 const key = () => sessionStorage.getItem('orbit.adminKey') || '';
-async function api<T = any>(path: string, init: RequestInit = {}) {
-  const r = await fetch('/admin' + path, {
-    ...init,
-    headers: {
-      ...(init.body && !(init.body instanceof FormData)
-        ? { 'content-type': 'application/json' }
-        : {}),
-      'x-admin-api-key': key(),
-      ...init.headers,
-    },
-  });
+const newTraceId = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+const safeApiRoute = (path: string) => path.split('?')[0]!.replace(/\/clients\/[^/]+/g, '/clients/:id').replace(/\/knowledge\/[^/]+/g, '/knowledge/:file').replace(/\/(sessions|conversations|leads|documents)\/[^/]+/g, '/$1/:id').replace(/\/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, '/:id').slice(0, 160);
+function clientDiagnostic(event: string, requestId: string, stage: string, operation: string, status: string, fields: Record<string, unknown> = {}) {
+  try { console.debug(JSON.stringify({ timestamp: new Date().toISOString(), level: 'info', event, requestId, traceId: requestId, entryPoint: 'dashboard', stage, operation, status, ...fields })); } catch {}
+}
+async function api<T = any>(path: string, init: RequestInit = {}, requestId = newTraceId()) {
+  const startedAt = performance.now(), method = init.method ?? 'GET', route = safeApiRoute(path);
+  clientDiagnostic('pipeline.client.request.started', requestId, 'client.request', 'fetch_admin_api', 'started', { inputMetrics: { method, route, bodyChars: typeof init.body === 'string' ? init.body.length : null } });
+  let r: Response;
+  try {
+    r = await fetch('/admin' + path, {
+      ...init,
+      headers: {
+        ...(init.body && !(init.body instanceof FormData)
+          ? { 'content-type': 'application/json' }
+          : {}),
+        'x-admin-api-key': key(),
+        'x-request-id': requestId,
+        'x-trace-id': requestId,
+        ...init.headers,
+      },
+    });
+  } catch (error) {
+    clientDiagnostic('pipeline.client.request.completed', requestId, 'client.request', 'fetch_admin_api', 'failed', { durationMs: performance.now() - startedAt, errorCode: 'NETWORK_ERROR', outputMetrics: { errorName: error instanceof Error ? error.name : 'unknown' } });
+    throw error;
+  }
+  const responseBytes = Number(r.headers.get('content-length')) || null;
   if (!r.ok) {
     let m = `Request failed (${r.status})`;
     let payload: any;
@@ -108,12 +124,25 @@ async function api<T = any>(path: string, init: RequestInit = {}) {
       payload = await r.json();
       m = payload.error.message;
     } catch {}
+    clientDiagnostic('pipeline.client.request.completed', requestId, 'client.request', 'fetch_admin_api', 'failed', { durationMs: performance.now() - startedAt, errorCode: 'HTTP_ERROR', outputMetrics: { httpStatus: r.status, responseBytes } });
     const error = new Error(m) as Error & { payload?: any };
     error.payload = payload;
     throw error;
   }
-  if (r.status === 204) return undefined as T;
-  return r.json() as Promise<T>;
+  if (r.status === 204) {
+    clientDiagnostic('pipeline.client.request.completed', requestId, 'client.request', 'fetch_admin_api', 'success', { durationMs: performance.now() - startedAt, outputMetrics: { httpStatus: r.status, responseBytes, parsed: false } });
+    return undefined as T;
+  }
+  try {
+    const parsed = await r.json() as T;
+    clientDiagnostic('pipeline.client.response.parsed', requestId, 'client.response', 'parse_admin_json', 'success', { durationMs: performance.now() - startedAt, outputMetrics: { httpStatus: r.status, responseBytes } });
+    clientDiagnostic('pipeline.client.request.completed', requestId, 'client.request', 'fetch_admin_api', 'success', { durationMs: performance.now() - startedAt, outputMetrics: { httpStatus: r.status, responseBytes, parsed: true } });
+    return parsed;
+  } catch (error) {
+    clientDiagnostic('pipeline.client.response.failed', requestId, 'client.response', 'parse_admin_json', 'failed', { durationMs: performance.now() - startedAt, errorCode: 'RESPONSE_PARSE_ERROR', outputMetrics: { httpStatus: r.status, responseBytes, errorName: error instanceof Error ? error.name : 'unknown' } });
+    clientDiagnostic('pipeline.client.request.completed', requestId, 'client.request', 'fetch_admin_api', 'failed', { durationMs: performance.now() - startedAt, errorCode: 'RESPONSE_PARSE_ERROR', outputMetrics: { httpStatus: r.status, responseBytes } });
+    throw error;
+  }
 }
 class Boundary extends Component<{ children: ReactNode }, { error?: Error }> {
   state: { error?: Error } = {};
@@ -694,6 +723,13 @@ function Prompt({ client, refresh }: { client?: Client; refresh: () => void }) {
     [history, setHistory] = useState<any[]>([]),
     [saved, setSaved] = useState(true),
     [preview, setPreview] = useState<any>();
+  const [previewTraceId, setPreviewTraceId] = useState<string>();
+  useEffect(() => {
+    if (!preview || !previewTraceId) return;
+    const answerChars = typeof preview.answer === 'string' ? preview.answer.length : null;
+    const retrievedChunks = Array.isArray(preview.retrieval?.sources) ? preview.retrieval.sources.length : Array.isArray(preview.sources) ? preview.sources.length : null;
+    clientDiagnostic('pipeline.client.preview.rendered', previewTraceId, 'client.render', 'render_prompt_preview', 'success', { outputMetrics: { answerChars, retrievedChunks, errorShown: Boolean(preview.error || preview.status === 'provider_error') } });
+  }, [preview, previewTraceId]);
   useEffect(() => {
     setPrompt(client?.prompt || '');
     if (client) api(`/clients/${client.id}/prompts/history`).then(setHistory);
@@ -721,12 +757,14 @@ function Prompt({ client, refresh }: { client?: Client; refresh: () => void }) {
   async function test(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const q = String(new FormData(e.currentTarget).get('q'));
+    const requestId = newTraceId();
     try {
       const r = await api<any>(`/clients/${client!.id}/prompts/preview`, {
         method: 'POST',
         body: JSON.stringify({ question: q, prompt }),
-      });
+      }, requestId);
       setPreview(r);
+      setPreviewTraceId(requestId);
     } catch (error) {
       const e = error as Error & { payload?: any };
       setPreview({
@@ -734,6 +772,7 @@ function Prompt({ client, refresh }: { client?: Client; refresh: () => void }) {
         error: e.message,
         retrieval: e.payload?.error?.details?.retrieval,
       });
+      setPreviewTraceId(requestId);
     }
   }
   return (
