@@ -3,6 +3,8 @@ import { createClientSchema, configSchema } from '../domain/schemas.js';
 import type { Context } from './context.js';
 import { safeEqual, normalizeDomain } from '../lib/security.js';
 import { AppError } from '../lib/errors.js';
+import type { PipelineContext } from '../lib/observability.js';
+import { safeRef } from '../lib/observability.js';
 import { z } from 'zod';
 import { loadLlmConfig } from '../config/llm.js';
 import { createLlmProvider } from '../providers/llm.js';
@@ -52,9 +54,14 @@ const presets: Record<string, string> = {
 };
 export async function adminRoutes(app: FastifyInstance, c: Context) {
   const auth = async (req: FastifyRequest) => {
+    const request = req as FastifyRequest & { pipelineContext?: PipelineContext };
+    const telemetry = request.pipelineContext ?? c.pipeline.createContext({ requestId: req.id, entryPoint: 'dashboard-admin-api' });
     const key = req.headers['x-admin-api-key'];
-    if (typeof key !== 'string' || !safeEqual(key, c.env.ADMIN_API_KEY))
+    if (typeof key !== 'string' || !safeEqual(key, c.env.ADMIN_API_KEY)) {
+      c.pipeline.emit(telemetry, 'pipeline.auth.failed', { stage: 'authentication', operation: 'admin_api_key', status: 'rejected', errorCode: 'ADMIN_UNAUTHORIZED', reason: typeof key === 'string' ? 'invalid_admin_credential' : 'missing_admin_credential' });
       throw new AppError(401, 'ADMIN_UNAUTHORIZED', 'Admin authentication required');
+    }
+    c.pipeline.emit(telemetry, 'pipeline.auth.completed', { stage: 'authentication', operation: 'admin_api_key', status: 'success', outputMetrics: { credentialPresent: true } });
   };
   app.addHook('preHandler', auth);
   app.post('/auth/validate', async () => ({ authenticated: true }));
@@ -196,15 +203,16 @@ export async function adminRoutes(app: FastifyInstance, c: Context) {
     });
   });
   app.post('/clients/:id/prompts/preview', async (req) => {
+    const telemetry = (req as FastifyRequest & { pipelineContext?: PipelineContext }).pipelineContext ?? c.pipeline.createContext({ requestId: req.id, entryPoint: 'dashboard-prompt-preview' });
     const { id } = idParams.parse(req.params),
-      body = z
-        .object({ question: z.string().min(1).max(1000), prompt: z.string().min(1).max(20000) })
-        .parse(req.body),
-      x = await c.repo.getClient(id);
+      body = z.object({ question: z.string().min(1).max(1000), prompt: z.string().min(1).max(20000) }).parse(req.body),
+      x = await c.pipeline.measure(telemetry, 'tenant', 'load_preview_tenant', () => c.repo.getClient(id), { inputMetrics: { tenantScoped: true } });
     if (!x) throw new AppError(404, 'NOT_FOUND', 'Client not found');
-    const preview = await c.chat.preview(id, body.question, body.prompt);
+    c.pipeline.setTenant(telemetry, id);
+    c.pipeline.emit(telemetry, 'pipeline.input.accepted', { stage: 'input', operation: 'prompt_preview', status: 'success', inputMetrics: { questionChars: body.question.length, promptChars: body.prompt.length } });
+    const preview = await c.chat.preview(id, body.question, body.prompt, telemetry);
     const context = preview.retrieval.evidence;
-    req.log.info({ clientId: id, retrievedChunks: context.length, status: preview.retrieval.decision.status, sources: context.map((chunk) => chunk.source) }, 'prompt preview retrieval');
+    c.pipeline.emit(telemetry, 'pipeline.preview.retrieval.completed', { stage: 'retrieval', operation: 'prompt_preview_retrieval', status: 'success', outputMetrics: { retrievedChunks: context.length, evidenceStatus: preview.retrieval.decision.status, sufficient: preview.retrieval.decision.sufficient, sourceCount: new Set(context.map((chunk) => chunk.source)).size, chunkRefs: context.slice(0, 20).map((chunk) => ({ chunkRef: safeRef(chunk.id), sourceRef: safeRef(chunk.source), score: chunk.score })) } });
     const sources = context.map((chunk) => ({ source: chunk.source, score: Math.round(chunk.score * 1000) / 1000, chunkId: chunk.id }));
     return { answer: preview.answer, retrieval: { count: context.length, sources }, sources };
   });
@@ -238,25 +246,34 @@ export async function adminRoutes(app: FastifyInstance, c: Context) {
     return { updated: true, config };
   });
   app.post('/clients/:id/knowledge', async (req) => {
+    const telemetry = (req as FastifyRequest & { pipelineContext?: PipelineContext }).pipelineContext ?? c.pipeline.createContext({ requestId: req.id, entryPoint: 'dashboard-knowledge-upload' });
     const { id } = idParams.parse(req.params);
     if (!(await c.repo.getClient(id))) throw new AppError(404, 'NOT_FOUND', 'Client not found');
+    c.pipeline.setTenant(telemetry, id);
     const results = [];
     for await (const part of req.parts()) {
-      if (part.type === 'file')
-        results.push(await c.knowledge.upload(id, part.filename, await part.toBuffer()));
+      if (part.type === 'file') {
+        const data = await part.toBuffer();
+        results.push(await c.knowledge.upload(id, part.filename, data, telemetry));
+      }
     }
     if (!results.length) throw new AppError(400, 'FILE_REQUIRED', 'At least one file is required');
+    c.pipeline.emit(telemetry, 'pipeline.knowledge_ingestion.completed', { stage: 'knowledge.ingestion', operation: 'upload_documents', status: 'success', outputMetrics: { fileCount: results.length, chunkCount: results.reduce((sum, result) => sum + result.chunks, 0) } });
     return results.length === 1 ? results[0] : { items: results };
   });
   app.get('/clients/:id/knowledge', async (req) => c.knowledge.list(idParams.parse(req.params).id));
   app.delete('/clients/:id/knowledge/:filename', async (req) => {
-    const { id } = idParams.parse(req.params),
-      { filename } = z.object({ filename: z.string().min(1) }).parse(req.params);
-    return c.knowledge.remove(id, decodeURIComponent(filename));
+    const telemetry = (req as FastifyRequest & { pipelineContext?: PipelineContext }).pipelineContext ?? c.pipeline.createContext({ requestId: req.id, entryPoint: 'dashboard-knowledge-delete' });
+    const { id } = idParams.parse(req.params), { filename } = z.object({ filename: z.string().min(1) }).parse(req.params);
+    c.pipeline.setTenant(telemetry, id);
+    return c.knowledge.remove(id, decodeURIComponent(filename), telemetry);
   });
-  app.post('/clients/:id/knowledge/rebuild', async (req) =>
-    c.knowledge.rebuild(idParams.parse(req.params).id),
-  );
+  app.post('/clients/:id/knowledge/rebuild', async (req) => {
+    const telemetry = (req as FastifyRequest & { pipelineContext?: PipelineContext }).pipelineContext ?? c.pipeline.createContext({ requestId: req.id, entryPoint: 'dashboard-knowledge-rebuild' });
+    const id = idParams.parse(req.params).id;
+    c.pipeline.setTenant(telemetry, id);
+    return c.knowledge.rebuild(id, telemetry);
+  });
   app.get('/clients/:id/leads', async (req) => {
     const { id } = idParams.parse(req.params),
       raw = req.query as Record<string, unknown>,
