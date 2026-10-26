@@ -9,6 +9,7 @@ import type { EmbeddingProvider } from '../providers/embedding.js';
 import type { LlmProvider } from '../providers/llm.js';
 import type { NotificationProvider } from '../providers/notification.js';
 import type { Metrics } from '../lib/metrics.js';
+import type { PipelineObserver } from '../lib/observability.js';
 export type Context = {
   env: Env;
   repo: Repository;
@@ -21,4 +22,5 @@ export type Context = {
   llm: LlmProvider;
   notification: NotificationProvider;
   metrics: Metrics;
+  pipeline: PipelineObserver;
 };
