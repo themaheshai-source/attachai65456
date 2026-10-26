@@ -326,6 +326,18 @@ export async function adminRoutes(app: FastifyInstance, c: Context) {
           rows.map((r) => columns.map((k) => esc(r[k])).join(',')).join('\n'),
       );
   });
+  app.get('/clients/:id/conversations', async (req) => {
+    const { id } = idParams.parse(req.params);
+    if (!(await c.repo.getClient(id))) throw new AppError(404, 'NOT_FOUND', 'Client not found');
+    return (await c.repo.conversations?.(id)) ?? [];
+  });
+  app.get('/clients/:id/conversations/:conversationId', async (req) => {
+    const { id } = idParams.parse(req.params),
+      { conversationId } = z.object({ conversationId: z.string().uuid() }).parse(req.params);
+    const conversation = await c.repo.conversationForClient(id, conversationId);
+    if (!conversation) throw new AppError(404, 'NOT_FOUND', 'Conversation not found');
+    return conversation;
+  });
   app.get('/clients/:id/analytics', async (req) => {
     const { id } = idParams.parse(req.params),
       { period } = z
