@@ -22,6 +22,8 @@ export type AdvancedRetrieval = {
   diagnostics: RetrievalDiagnostics;
 };
 
+export type RetrievalDiagnosticCallback = (stage: string, metrics: Record<string, unknown>) => void;
+
 const STOPWORDS = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'what', 'which', 'who', 'how', 'much', 'does', 'do', 'did', 'of', 'for', 'to', 'in', 'on', 'and', 'or', 'will', 'can', 'i', 'my', 'it', 'this', 'that', 'with', 'when', 'where', 'why']);
 const SYNONYMS: Record<string, string> = {
   cancellation: 'cancel',
@@ -248,29 +250,51 @@ export async function retrieveAdvancedEvidence(input: {
   question: string;
   corpus: RetrievedChunk[];
   dense: RetrievedChunk[];
+  onDiagnostic?: RetrievalDiagnosticCallback;
 }): Promise<AdvancedRetrieval> {
+  const retrievalStarted = process.hrtime.bigint();
+  const elapsedMs = (started: bigint) => Number(process.hrtime.bigint() - started) / 1_000_000;
+  const diagnostic = (stage: string, metrics: Record<string, unknown>) => {
+    try { input.onDiagnostic?.(stage, metrics); } catch { /* diagnostic callbacks must not alter retrieval */ }
+  };
+  const summarizeScores = (chunks: RetrievedChunk[]) => {
+    const scores = chunks.map((chunk) => chunk.score).filter(Number.isFinite).sort((a, b) => a - b);
+    return { min: scores[0] ?? null, median: scores.length ? scores[Math.floor((scores.length - 1) / 2)]! : null, max: scores.at(-1) ?? null };
+  };
   const denseScores = new Map<string, number>();
   for (const chunk of input.dense) {
     denseScores.set(chunk.id, Math.max(denseScores.get(chunk.id) ?? 0, chunk.score));
   }
+  const profileStarted = process.hrtime.bigint();
+  const combinedCorpusCount = input.dense.length + input.corpus.length;
   const corpus = deduplicate([...input.dense, ...input.corpus]);
   const corpusProfile = profile(corpus);
+  if (input.onDiagnostic) diagnostic('corpus_profile', { durationMs: elapsedMs(profileStarted), inputDenseCount: input.dense.length, inputCorpusCount: input.corpus.length, combinedCorpusCount, distinctCorpusCount: corpus.length, duplicateCount: combinedCorpusCount - corpus.length, documentCount: corpusProfile.documents, vocabularyCount: corpusProfile.vocabulary });
   const run = (query: string, dense: RetrievedChunk[]) => {
+    const runStarted = process.hrtime.bigint();
+    let phaseStarted = process.hrtime.bigint();
     const exact = exactSearch(query, corpus);
+    const exactDurationMs = elapsedMs(phaseStarted);
+    phaseStarted = process.hrtime.bigint();
     const keyword = keywordSearch(query, corpus);
+    const keywordDurationMs = elapsedMs(phaseStarted);
+    phaseStarted = process.hrtime.bigint();
     const bm25 = bm25Search(query, corpus);
+    const bm25DurationMs = elapsedMs(phaseStarted);
+    phaseStarted = process.hrtime.bigint();
     const fused = rrf([exact, keyword, bm25, dense.slice(0, RETRIEVAL_K)]);
-    return {
-      exact,
-      keyword,
-      bm25,
-      fused,
-      ranked: rerank(query, fused, corpusProfile.topTerms, denseScores).slice(0, FINAL_K),
-    };
+    const fusionDurationMs = elapsedMs(phaseStarted);
+    phaseStarted = process.hrtime.bigint();
+    const ranked = rerank(query, fused, corpusProfile.topTerms, denseScores).slice(0, FINAL_K);
+    const rerankDurationMs = elapsedMs(phaseStarted);
+    if (input.onDiagnostic) diagnostic('candidate_generation', { durationMs: elapsedMs(runStarted), exactDurationMs, keywordDurationMs, bm25DurationMs, fusionDurationMs, rerankDurationMs, queryChars: query.length, exactCount: exact.length, keywordCount: keyword.length, bm25Count: bm25.length, denseCount: dense.length, fusedCount: fused.length, rankedCount: ranked.length, exactScoreRange: summarizeScores(exact), keywordScoreRange: summarizeScores(keyword), bm25ScoreRange: summarizeScores(bm25), denseScoreRange: summarizeScores(dense), fusedScoreRange: summarizeScores(fused), ranked: ranked.slice(0, FINAL_K).map((chunk) => ({ id: chunk.id, score: chunk.score })) });
+    return { exact, keyword, bm25, fused, ranked };
   };
   const first = run(input.question, input.dense);
+  let contextStarted = process.hrtime.bigint();
   let selected = selectContext(first.ranked);
   let decision = evaluateEvidence(input.question, selected);
+  if (input.onDiagnostic) diagnostic('context_selection', { durationMs: elapsedMs(contextStarted), candidateCount: first.ranked.length, selectedCount: selected.length, selectedChars: selected.reduce((sum, chunk) => sum + chunk.text.length, 0), selected: selected.map((chunk) => ({ id: chunk.id, score: chunk.score, textChars: chunk.text.length })), decision });
   let expanded = false;
   let candidateCounts = {
     exact: first.exact.length,
@@ -288,8 +312,11 @@ export async function retrieveAdvancedEvidence(input: {
     seedChunks.length > 0
   ) {
     expanded = true;
+    const expansionStarted = process.hrtime.bigint();
     const query = expandedQuery(input.question, seedChunks);
+    if (input.onDiagnostic) diagnostic('query_expansion', { durationMs: elapsedMs(expansionStarted), executed: true, reason: 'initial_evidence_uncertain_or_not_supported_with_seed_candidates', seedCount: seedChunks.length, inputQueryChars: input.question.length, expandedQueryChars: query.length, expandedByChars: Math.max(0, query.length - input.question.length) });
     const second = run(query, []);
+    contextStarted = process.hrtime.bigint();
     selected = selectContext(
       rerank(
         input.question,
@@ -299,6 +326,7 @@ export async function retrieveAdvancedEvidence(input: {
       ).slice(0, FINAL_K),
     );
     decision = evaluateEvidence(input.question, selected);
+    if (input.onDiagnostic) diagnostic('context_selection_after_expansion', { durationMs: elapsedMs(contextStarted), candidateCount: second.fused.length, selectedCount: selected.length, selectedChars: selected.reduce((sum, chunk) => sum + chunk.text.length, 0), selected: selected.map((chunk) => ({ id: chunk.id, score: chunk.score, textChars: chunk.text.length })), decision });
     candidateCounts = {
       exact: first.exact.length + second.exact.length,
       keyword: first.keyword.length + second.keyword.length,
@@ -307,9 +335,11 @@ export async function retrieveAdvancedEvidence(input: {
       fused: Math.min(MAX_CANDIDATES, first.fused.length + second.fused.length),
     };
   }
+  if (!expanded && input.onDiagnostic) diagnostic('query_expansion', { durationMs: 0, executed: false, reason: 'initial_evidence_did_not_trigger_expansion', seedCount: seedChunks.length });
   const rejected = selected
     .filter((chunk) => chunk.score < 0.2)
     .map((chunk) => ({ id: chunk.id, reason: 'low deterministic rerank score' }));
+  if (input.onDiagnostic) diagnostic('retrieval.completed', { durationMs: elapsedMs(retrievalStarted), evidenceCount: selected.length, candidateCounts, decision, expanded, rejectedCount: rejected.length, contextChars: selected.reduce((sum, chunk) => sum + chunk.text.length, 0) });
   return {
     evidence: selected,
     decision,
