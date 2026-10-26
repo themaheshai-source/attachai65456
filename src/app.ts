@@ -24,6 +24,7 @@ import { ClientService } from './services/clients.js';
 import { KnowledgeService } from './services/knowledge.js';
 import { ChatService } from './services/chat.js';
 import { Metrics } from './lib/metrics.js';
+import { createRequestContext, PipelineObserver, safeErrorCode } from './lib/observability.js';
 import { AppError } from './lib/errors.js';
 import { adminRoutes } from './routes/admin.js';
 import { publicRoutes } from './routes/public.js';
@@ -44,6 +45,7 @@ export async function buildApp(env: Env) {
     bodyLimit: 1024 * 1024,
     requestTimeout: 30000,
   });
+  const pipeline = new PipelineObserver(app.log, env.PIPELINE_DIAGNOSTICS);
   const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY;
   const repo =
     env.DATABASE_PROVIDER === 'supabase'
@@ -79,8 +81,8 @@ export async function buildApp(env: Env) {
         : new OutboxNotification(path.join(env.DATA_DIR, 'outbox'));
   const metrics = new Metrics();
   const clients = new ClientService(repo, storage, vector, env.PUBLIC_BASE_URL);
-  const knowledge = new KnowledgeService(storage, embedding, vector, repo);
-  const chat = new ChatService(repo, embedding, vector, llm);
+  const knowledge = new KnowledgeService(storage, embedding, vector, repo, pipeline);
+  const chat = new ChatService(repo, embedding, vector, llm, pipeline);
   const ctx = {
     env,
     repo,
@@ -90,6 +92,7 @@ export async function buildApp(env: Env) {
     llm,
     notification,
     metrics,
+    pipeline,
     clients,
     knowledge,
     chat,
@@ -110,7 +113,7 @@ export async function buildApp(env: Env) {
               else originCb(null, false);
             },
         methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-        allowedHeaders: ['content-type', 'x-admin-api-key', 'x-api-key'],
+        allowedHeaders: ['content-type', 'x-admin-api-key', 'x-api-key', 'x-request-id', 'x-trace-id'],
       });
     },
   });
@@ -141,15 +144,31 @@ export async function buildApp(env: Env) {
     },
   });
   app.addHook('onRequest', async (req) => {
-    (req as typeof req & { startedAt: number }).startedAt = Date.now();
+    const extended = req as typeof req & { startedAt: bigint; pipelineContext: ReturnType<typeof createRequestContext> };
+    extended.startedAt = process.hrtime.bigint();
+    extended.pipelineContext = createRequestContext(pipeline, req as typeof req & { headers: Record<string, unknown> });
+    pipeline.emit(extended.pipelineContext, 'pipeline.request.started', {
+      stage: 'request', operation: 'http_request', status: 'started',
+      inputMetrics: { method: req.method, route: (req.routeOptions?.url ?? req.url.split('?')[0] ?? 'unknown').replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, '/:id').slice(0, 160), bodyBytes: typeof req.headers['content-length'] === 'string' ? Number(req.headers['content-length']) || 0 : null },
+    });
   });
-  app.addHook('onResponse', async (req, reply) =>
-    metrics.record(
-      Date.now() - (req as typeof req & { startedAt: number }).startedAt,
-      reply.statusCode,
-    ),
-  );
-  app.setErrorHandler((e, _req, reply) => {
+  app.addHook('onResponse', async (req, reply) => {
+    const extended = req as typeof req & { startedAt: bigint; pipelineContext?: ReturnType<typeof createRequestContext> };
+    const durationMs = Number(process.hrtime.bigint() - (extended.startedAt ?? process.hrtime.bigint())) / 1_000_000;
+    metrics.record(durationMs, reply.statusCode);
+    if (extended.pipelineContext) pipeline.emit(extended.pipelineContext, 'pipeline.request.completed', {
+      stage: 'request', operation: 'http_response', status: reply.statusCode >= 400 ? 'failed' : 'success', durationMs,
+      outputMetrics: { httpStatus: reply.statusCode, responseBytes: Number(reply.getHeader('content-length')) || 0 },
+      reason: reply.statusCode >= 400 ? 'http_error_response' : null,
+    });
+  });
+  app.setErrorHandler((e, req, reply) => {
+    const extended = req as typeof req & { pipelineContext?: ReturnType<typeof createRequestContext> };
+    if (extended.pipelineContext) pipeline.emit(extended.pipelineContext, e instanceof ZodError ? 'pipeline.request.rejected' : 'pipeline.request.failed', {
+      stage: 'request.validation', operation: 'request_handler', status: e instanceof ZodError ? 'rejected' : 'failed',
+      errorCode: e instanceof ZodError ? 'VALIDATION_ERROR' : (e instanceof AppError ? e.code : safeErrorCode(e)),
+      outputMetrics: { httpStatus: e instanceof ZodError ? 400 : e instanceof AppError ? e.statusCode : 500 },
+    });
     if (e instanceof ZodError)
       return reply.code(400).send({
         error: {
@@ -164,7 +183,7 @@ export async function buildApp(env: Env) {
       return reply
         .code(409)
         .send({ error: { code: 'CONFLICT', message: 'Resource already exists' } });
-    app.log.error({ err: e }, 'request failed');
+    app.log.error({ requestId: extended.pipelineContext?.requestId ?? req.id, errorCode: safeErrorCode(e), errorName: e instanceof Error ? e.name : typeof e }, 'request failed');
     return reply
       .code(500)
       .send({ error: { code: 'INTERNAL_ERROR', message: 'An internal error occurred' } });
