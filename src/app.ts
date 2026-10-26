@@ -5,6 +5,8 @@ import rateLimit from '@fastify/rate-limit';
 import multipart from '@fastify/multipart';
 import staticPlugin from '@fastify/static';
 import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { ZodError } from 'zod';
 import type { Env } from './config/env.js';
 import { SqliteRepository } from './repositories/sqlite.js';
@@ -118,8 +120,14 @@ export async function buildApp(env: Env) {
     keyGenerator: (req) => req.ip,
   });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 10, parts: 15 } });
+  const publicRoot =
+    [
+      fileURLToPath(new URL('../public', import.meta.url)),
+      fileURLToPath(new URL('../../public', import.meta.url)),
+      path.resolve('public'),
+    ].find((candidate) => fs.existsSync(candidate)) ?? path.resolve('public');
   await app.register(staticPlugin, {
-    root: path.resolve('public'),
+    root: publicRoot,
     prefix: '/',
     setHeaders: (res, pathName) => {
       if (pathName.endsWith('widget.js')) {
