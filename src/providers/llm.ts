@@ -1,5 +1,6 @@
 import type { ChatMessage, ClientConfig, ProviderHealth, RetrievedChunk } from '../domain/types.js';
 import type { LlmConfig } from '../config/llm.js';
+import { tokens } from '../services/advanced-rag.js';
 export type ChatDebug = (stage: string, data: Record<string, unknown>) => void;
 export interface LlmInput { question: string; prompt: string; context: RetrievedChunk[]; config: ClientConfig; history?: ChatMessage[]; debug?: ChatDebug }
 export interface LlmProvider {
@@ -48,19 +49,41 @@ function tenantIdentityAnswer(question: string, config: ClientConfig) {
   return `I’m ${assistant}. I’m here to help with this tenant’s products, services, and information.`;
 }
 
+const QUESTION_STOPWORDS = new Set([
+  'what', 'how', 'can', 'who', 'where', 'when', 'why', 'which', 'does', 'are', 'the',
+  'for', 'with', 'your', 'you', 'our', 'its', 'this', 'that', 'have', 'has', 'from',
+  'tell', 'about', 'please', 'could', 'would', 'should', 'there', 'their', 'they',
+]);
+
 export class LocalLlm implements LlmProvider {
   readonly name: string;
   constructor(private providerName = 'local') { this.name = providerName === 'local' ? 'local-extractive' : providerName; }
   async answer(i: LlmInput) {
     const identity = tenantIdentityAnswer(i.question, i.config);
     if (identity) return identity;
-    if (/\b(summarize|recap|what did i|what you just)\b/i.test(i.question) && i.history?.length)
+    if (/\b(summarize|summary|recap|what did i|what did we|what you just)\b/i.test(i.question) && i.history?.length)
       return i.history.slice(-4).map((x) => x.content).join(' ');
-    const terms = new Set(i.question.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-    const sentences = [...i.context.flatMap((c) => c.text.split(/(?<=[.!?])\s+/)), ...(i.history ?? []).map((x) => x.content)]
-      .map((s) => ({ s, hit: [...terms].filter((t) => s.toLowerCase().includes(t)).length }))
-      .filter((x) => x.hit > 0).sort((a, b) => b.hit - a.hit).slice(0, 3);
-    return sentences.length ? sentences.map((x) => x.s).join(' ') : i.config.fallbackMessage;
+    const rawTerms = (i.question.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []).filter((t) => !QUESTION_STOPWORDS.has(t));
+    const expandedTerms = new Set([...rawTerms, ...tokens(i.question).filter((t) => t.length >= 3 && !QUESTION_STOPWORDS.has(t))]);
+    const activeTerms = expandedTerms.size ? expandedTerms : new Set(i.question.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+    const contextSentences = i.context
+      .flatMap((c) => c.text.split(/(?<=[.!?])\s+/))
+      .map((s) => ({ s, hit: [...activeTerms].filter((t) => s.toLowerCase().includes(t)).length }))
+      .filter((x) => x.hit > 0)
+      .sort((a, b) => b.hit - a.hit)
+      .slice(0, 3);
+    if (contextSentences.length) return contextSentences.map((x) => x.s).join(' ');
+    const historySentences = (i.history ?? [])
+      .filter((x) => x.role === 'user' || !x.content.includes(i.config.fallbackMessage))
+      .flatMap((x) => x.content.split(/(?<=[.!?])\s+/))
+      .filter((s) => !s.trim().endsWith('?'))
+      .map((s) => ({ s, hit: [...activeTerms].filter((t) => s.toLowerCase().includes(t)).length }))
+      .filter((x) => x.hit > 0)
+      .sort((a, b) => b.hit - a.hit)
+      .slice(0, 3);
+    if (historySentences.length) return historySentences.map((x) => x.s).join(' ');
+    if (i.context.length > 0 && (i.context[0]?.score ?? 0) >= 0.25) return i.context[0]!.text;
+    return i.config.fallbackMessage;
   }
   async streamAnswer(i: LlmInput, onToken: (token: string) => void) {
     const answer = await this.answer(i);
