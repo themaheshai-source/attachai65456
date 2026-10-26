@@ -65,7 +65,8 @@ export async function publicRoutes(app: FastifyInstance, c: Context) {
     if (conversationId && !(await c.repo.conversationForClient(tid, conversationId)))
       throw new AppError(404, 'CONVERSATION_NOT_FOUND', 'Conversation not found');
     const destination = client.config.notificationEmail ?? client.config.teamEmail;
-    if (!destination) throw new AppError(503, 'LEAD_DELIVERY_UNAVAILABLE', 'Lead delivery is not configured');
+    if (!destination && c.notification.name === 'smtp')
+      throw new AppError(503, 'LEAD_DELIVERY_UNAVAILABLE', 'Lead delivery is not configured');
     const id = await c.repo.saveLead(tid, conversationId, data);
     try {
       await c.notification.notify(destination, `New lead for ${client.name}`, {
