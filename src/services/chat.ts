@@ -830,9 +830,32 @@ export class ChatService {
         inputMetrics: { provider: this.llm.name, purpose: 'answer_generation', streaming: false, contextChunks: llmInput.context.length, questionChars: question.length },
       });
     } catch (error) {
-      this.traceSummary(prepared.telemetry).failedStages.push('llm.answer_generation.generate_initial_answer');
-      this.emitTraceSummary(prepared, 'failed', '', safeErrorCode(error));
-      throw error;
+      const summary = this.traceSummary(prepared.telemetry);
+      const failedStage = 'llm.answer_generation.generate_initial_answer';
+      if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+
+      const fallback = this.selectAnswer(
+        prepared,
+        'fallback',
+        prepared.client.config.fallbackMessage,
+        'llm_provider_failure',
+      );
+      this.emit(
+        prepared.telemetry,
+        'pipeline.fallback.selected',
+        'answer.fallback',
+        'llm_provider_failure',
+        'fallback',
+        {
+          reason: safeErrorCode(error),
+          outputMetrics: {
+            fallbackChars: fallback.length,
+            providerFailure: safeErrorCode(error),
+            failedStage,
+          },
+        },
+      );
+      return fallback;
     }
     const summary = this.traceSummary(prepared.telemetry);
     summary.initialAnswerGenerated = true;
@@ -878,9 +901,34 @@ export class ChatService {
         inputMetrics: { provider: this.llm.name, purpose: 'grounding_correction', streaming: false, correctionReasonCount: firstCheck.reasons.length, contextChunks: correctionInput.context.length },
       });
     } catch (error) {
-      this.traceSummary(prepared.telemetry).failedStages.push('llm.grounding_correction.generate_corrected_answer');
-      this.emitTraceSummary(prepared, 'failed', first, safeErrorCode(error));
-      throw error;
+      const summary = this.traceSummary(prepared.telemetry);
+      const failedStage = 'llm.grounding_correction.generate_corrected_answer';
+      if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+
+      // The initial answer already failed grounding. Never return it just because
+      // the correction call timed out; return the configured fallback instead.
+      const fallback = this.selectAnswer(
+        prepared,
+        'fallback',
+        prepared.client.config.fallbackMessage,
+        'llm_correction_provider_failure',
+      );
+      this.emit(
+        prepared.telemetry,
+        'pipeline.fallback.selected',
+        'answer.fallback',
+        'llm_correction_provider_failure',
+        'fallback',
+        {
+          reason: safeErrorCode(error),
+          outputMetrics: {
+            fallbackChars: fallback.length,
+            providerFailure: safeErrorCode(error),
+            failedStage,
+          },
+        },
+      );
+      return fallback;
     }
     const corrected = cleanAnswerScaffolding(correctedRaw);
     this.pipeline.emitForensic(prepared.telemetry, 'pipeline.answer.corrected.raw', {
