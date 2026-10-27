@@ -35,7 +35,7 @@ export async function buildApp(env: Env) {
       env.NODE_ENV === 'test'
         ? false
         : {
-            level: 'info',
+            level: env.PIPELINE_DEBUG_LOG_LEVEL,
             redact: [
               'req.headers.x-api-key',
               'req.headers.x-admin-api-key',
@@ -45,7 +45,12 @@ export async function buildApp(env: Env) {
     bodyLimit: 1024 * 1024,
     requestTimeout: 30000,
   });
-  const pipeline = new PipelineObserver(app.log, env.PIPELINE_DIAGNOSTICS);
+  const pipeline = new PipelineObserver(app.log, env.PIPELINE_DIAGNOSTICS, {
+    enabled: env.PIPELINE_DEBUG_LOGS_ENABLED,
+    level: env.PIPELINE_DEBUG_LOG_LEVEL,
+    fullText: env.PIPELINE_DEBUG_LOG_FULL_TEXT,
+    maxTextChars: env.PIPELINE_DEBUG_LOG_MAX_TEXT_CHARS,
+  });
   const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY;
   const repo =
     env.DATABASE_PROVIDER === 'supabase'
@@ -156,11 +161,36 @@ export async function buildApp(env: Env) {
     const extended = req as typeof req & { startedAt: bigint; pipelineContext?: ReturnType<typeof createRequestContext> };
     const durationMs = Number(process.hrtime.bigint() - (extended.startedAt ?? process.hrtime.bigint())) / 1_000_000;
     metrics.record(durationMs, reply.statusCode);
-    if (extended.pipelineContext) pipeline.emit(extended.pipelineContext, 'pipeline.request.completed', {
-      stage: 'request', operation: 'http_response', status: reply.statusCode >= 400 ? 'failed' : 'success', durationMs,
-      outputMetrics: { httpStatus: reply.statusCode, responseBytes: Number(reply.getHeader('content-length')) || 0 },
-      reason: reply.statusCode >= 400 ? 'http_error_response' : null,
-    });
+    if (extended.pipelineContext) {
+      const rawContentLength = reply.getHeader('content-length');
+      const declaredResponseBytes = typeof rawContentLength === 'number'
+        ? rawContentLength
+        : typeof rawContentLength === 'string' && /^\d+$/.test(rawContentLength) ? Number(rawContentLength) : null;
+      pipeline.emit(extended.pipelineContext, 'pipeline.request.completed', {
+        stage: 'request', operation: 'http_response', status: reply.statusCode >= 400 ? 'failed' : 'success', durationMs,
+        outputMetrics: { httpStatus: reply.statusCode, declaredResponseBytes },
+        reason: reply.statusCode >= 400 ? 'http_error_response' : null,
+      });
+      pipeline.emitForensic(extended.pipelineContext, 'pipeline.trace.summary', {
+        stage: 'pipeline.trace', operation: 'summarize_http_request',
+        status: reply.statusCode >= 400 ? 'failed' : 'success', durationMs,
+        reason: reply.statusCode >= 400 ? 'http_error_response' : null,
+        metadata: {
+          terminalBoundary: 'fastify_onResponse',
+          httpStatus: reply.statusCode,
+          declaredResponseBytes,
+          clientReceiptConfirmed: false,
+          service: extended.pipelineContext.traceSummary ?? null,
+          delivery: extended.pipelineContext.deliverySummary ?? null,
+        },
+        output: {
+          httpStatus: reply.statusCode,
+          declaredResponseBytes,
+          finalResponseSource: extended.pipelineContext.traceSummary?.finalResponseSource ?? 'unknown',
+          clientReceiptConfirmed: false,
+        },
+      });
+    }
   });
   app.setErrorHandler((e, req, reply) => {
     const extended = req as typeof req & { pipelineContext?: ReturnType<typeof createRequestContext> };
