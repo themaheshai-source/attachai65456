@@ -14,6 +14,7 @@ import {
   type RetrievalDiagnostics,
 } from './advanced-rag.js';
 import { groundingCorrection, validateGrounding, type GroundingCheck, type GroundingDiagnostics, type GroundingRuleDiagnostic } from './grounding.js';
+import { isTenantIdentityQuestion, tenantIdentityAnswer } from './identity.js';
 
 type ChatResult = {
   sessionId: string;
@@ -819,6 +820,13 @@ export class ChatService {
   }
 
   private async answerWithGrounding(prepared: Prepared, question: string, prompt = prepared.client.prompt) {
+    const identity = tenantIdentityAnswer(question, prepared.client.config);
+    if (identity) {
+      this.emit(prepared.telemetry, 'pipeline.answer.selected', 'answer.selection', 'select_configured_tenant_identity', 'success', {
+        reason: 'configured_tenant_identity', outputMetrics: { answerChars: identity.length, providerSkipped: true },
+      });
+      return this.selectAnswer(prepared, 'initial', identity, 'configured_tenant_identity');
+    }
     const evidence = this.groundingEvidence(prepared, question);
     const llmInput = this.llmInput(prepared, question, prompt);
     this.emit(prepared.telemetry, 'pipeline.llm.call.started', 'llm.answer_generation', 'generate_initial_answer', 'started', {
@@ -980,9 +988,9 @@ export class ChatService {
       started: Date.now(),
       summary: false,
     } satisfies Prepared;
-    const canGenerate = retrieval.decision.sufficient || clearlyGeneral(message);
+    const canGenerate = retrieval.decision.sufficient || clearlyGeneral(message) || isTenantIdentityQuestion(message);
     this.emit(telemetry, canGenerate ? 'pipeline.stage.completed' : 'pipeline.stage.skipped', 'answer_generation', 'prompt_preview_generation', canGenerate ? 'success' : 'skipped', {
-      reason: canGenerate ? (retrieval.decision.sufficient ? 'evidence_sufficient' : 'general_conversation') : 'evidence_insufficient',
+      reason: canGenerate ? (retrieval.decision.sufficient ? 'evidence_sufficient' : isTenantIdentityQuestion(message) ? 'configured_tenant_identity' : 'general_conversation') : 'evidence_insufficient',
       outputMetrics: { evidenceStatus: retrieval.decision.status, sufficient: retrieval.decision.sufficient },
     });
     const answer = canGenerate ? await this.answerWithGrounding(prepared, message, prompt) : this.selectAnswer(prepared, 'fallback', retrieval.client.config.fallbackMessage, 'evidence_insufficient_before_llm');
@@ -1030,7 +1038,7 @@ export class ChatService {
       rejected: [],
     };
     const isSummary = summaryRequest(message);
-    const isGeneral = clearlyGeneral(message);
+    const isGeneral = clearlyGeneral(message) || isTenantIdentityQuestion(message);
     this.emit(telemetry, 'pipeline.input.classified', 'input.classification', 'classify_request_branch', 'success', {
       inputMetrics: { messageChars: message.length },
       outputMetrics: { summaryRequest: isSummary, clearlyGeneral: isGeneral, historyMessageCount: history.length },
@@ -1139,7 +1147,7 @@ export class ChatService {
     this.emit(prepared.telemetry, 'pipeline.history.followup_decision', 'conversation.history', 'evaluate_history_support', 'success', {
       outputMetrics: { canUseHistory, historyMessages: prepared.history.length }, reason: canUseHistory ? 'history_supports_follow_up' : 'history_not_used_as_evidence',
     });
-    if (!prepared.decision.sufficient && !clearlyGeneral(message) && !canUseHistory) {
+    if (!prepared.decision.sufficient && !clearlyGeneral(message) && !isTenantIdentityQuestion(message) && !canUseHistory) {
       const fallback = tenantFallback(prepared.client);
       this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'evidence_insufficient_before_llm', 'fallback', {
         reason: 'evidence_insufficient_before_llm', outputMetrics: { evidenceStatus: prepared.decision.status, coverage: prepared.decision.coverage, evidenceCount: prepared.decision.count, fallbackChars: fallback.length, llmSkipped: true },
@@ -1189,6 +1197,15 @@ export class ChatService {
       const selectedSummary = this.selectAnswer(prepared, 'summary', cleanedSummary, 'conversation_summary_generated');
       for (const token of answerTokens(selectedSummary)) onToken(token);
       return this.finalize(prepared, selectedSummary);
+    }
+    const identity = tenantIdentityAnswer(message, prepared.client.config);
+    if (identity) {
+      const selected = cleanAnswerScaffolding(this.selectAnswer(prepared, 'initial', identity, 'configured_tenant_identity'));
+      this.emit(prepared.telemetry, 'pipeline.answer.selected', 'answer.selection', 'select_configured_tenant_identity', 'success', {
+        reason: 'configured_tenant_identity', outputMetrics: { answerChars: selected.length, providerSkipped: true, streaming: true },
+      });
+      for (const token of answerTokens(selected)) onToken(token);
+      return this.finalize(prepared, selected);
     }
     const canUseHistory = historySupportsFollowUp(message, prepared.history);
     this.emit(prepared.telemetry, 'pipeline.history.followup_decision', 'conversation.history', 'evaluate_history_support', 'success', {
