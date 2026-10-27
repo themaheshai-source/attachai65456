@@ -108,13 +108,26 @@ describe('generic RAG recovery and grounding path', () => {
     expect(result.answer).not.toMatch(/(?:^|\\s)(?:Q:|A:|## FAQ)/i);
   });
 
+
   it('keeps a genuinely unknown question on the configured fallback', async () => {
+    const { service, llm, vector } = fixture({
+      answer: async () => 'UNKNOWN',
+    });
+
+    const result = await service.chat('tenant-a', 'What is the meaning of life?');
+
+    expect(vector.search).not.toHaveBeenCalled();
+    expect(llm.answer).toHaveBeenCalledOnce();
+    expect(result.answer).toBe('UNKNOWN');
+  });
+
   it('returns configured fallback when initial LLM generation throws', async () => {
     const relevant = chunk(
       'service',
       'AttachAI is a personalized AI assistant service for business websites.',
       0.82,
     );
+
     const { service, llm } = fixture({
       search: async () => [relevant],
       answer: async () => {
@@ -123,15 +136,9 @@ describe('generic RAG recovery and grounding path', () => {
     });
 
     const result = await service.chat('tenant-a', 'What does AttachAI do?');
-    expect(result.answer).toBe('UNKNOWN');
-    expect(llm.answer).toHaveBeenCalledOnce();
-  });
 
-    const { service, llm, vector } = fixture({ answer: async () => 'UNKNOWN' });
-    const result = await service.chat('tenant-a', 'What is the meaning of life?');
-    expect(vector.search).not.toHaveBeenCalled();
-    expect(llm.answer).toHaveBeenCalledOnce();
     expect(result.answer).toBe('UNKNOWN');
+    expect(llm.answer).toHaveBeenCalledOnce();
   });
 
   it('keeps standalone factual retrieval independent of prior chat answers', async () => {
