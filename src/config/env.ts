@@ -4,6 +4,10 @@ import { loadLlmConfig, type LlmConfig } from './llm.js';
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PIPELINE_DIAGNOSTICS: z.enum(['off', 'basic', 'detailed']).default('basic'),
+  PIPELINE_DEBUG_LOGS_ENABLED: z.enum(['true', 'false']).transform((value) => value === 'true').default('true'),
+  PIPELINE_DEBUG_LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  PIPELINE_DEBUG_LOG_FULL_TEXT: z.enum(['true', 'false']).transform((value) => value === 'true').default('false'),
+  PIPELINE_DEBUG_LOG_MAX_TEXT_CHARS: z.coerce.number().int().min(128).max(200000).default(12000),
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().positive().default(3000),
   ADMIN_API_KEY: z.string().min(16).default('local-development-admin-key'),
