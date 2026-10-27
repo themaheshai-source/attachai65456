@@ -3,7 +3,7 @@ import type { ChatMessage, ClientConfig, ProviderHealth, RetrievedChunk } from '
 import type { LlmConfig } from '../config/llm.js';
 import { tokens } from '../services/advanced-rag.js';
 export type ChatDebug = (stage: string, data: Record<string, unknown>) => void;
-export interface LlmInput { question: string; prompt: string; context: RetrievedChunk[]; config: ClientConfig; history?: ChatMessage[]; debug?: ChatDebug; debugDetailed?: boolean }
+export interface LlmInput { question: string; prompt: string; context: RetrievedChunk[]; config: ClientConfig; history?: ChatMessage[]; debug?: ChatDebug; debugDetailed?: boolean; debugFullText?: boolean }
 export interface LlmProvider {
   readonly name: string;
   answer(input: LlmInput): Promise<string>;
@@ -135,9 +135,12 @@ export class OpenAICompatibleLlm implements LlmProvider {
       { role: 'user', content: `USER\nQuestion: ${i.question}` },
     ];
     const contextText = context || '(none)';
+    const payload = { model: this.config.model, temperature: this.config.sampling.temperature,
+      ...(this.config.sampling.topP === undefined ? {} : { top_p: this.config.sampling.topP }),
+      ...(this.config.sampling.maxTokens === undefined ? {} : { max_tokens: this.config.sampling.maxTokens }), stream, messages };
     if (i.debug && i.debugDetailed) {
       const serializedMessages = JSON.stringify(messages);
-      const serializedPayload = JSON.stringify({ model: this.config.model, stream, messages });
+      const serializedPayload = JSON.stringify(payload);
       i.debug('LLM_INPUT_BOUNDARY', {
         provider: this.config.providerName, model: this.config.model, stream,
         messageCount: messages.length, payloadChars: messages.reduce((total, message) => total + message.content.length, 0),
@@ -150,9 +153,13 @@ export class OpenAICompatibleLlm implements LlmProvider {
         maxOutputTokens: this.config.sampling.maxTokens ?? null,
       });
     }
-    return { model: this.config.model, temperature: this.config.sampling.temperature,
-      ...(this.config.sampling.topP === undefined ? {} : { top_p: this.config.sampling.topP }),
-      ...(this.config.sampling.maxTokens === undefined ? {} : { max_tokens: this.config.sampling.maxTokens }), stream, messages };
+    if (i.debug && i.debugFullText) {
+      i.debug('LLM_INPUT_BOUNDARY_FULL', {
+        provider: this.config.providerName, model: this.config.model, purpose: stream ? 'stream_answer_generation' : 'answer_generation',
+        stream, payload, serializedPayload: JSON.stringify(payload),
+      });
+    }
+    return payload;
   }
   async answer(i: LlmInput) {
     const identity = tenantIdentityAnswer(i.question, i.config);
@@ -166,6 +173,7 @@ export class OpenAICompatibleLlm implements LlmProvider {
     try { j = await r.json() as typeof j; }
     catch (error) { i.debug?.('LLM_RESPONSE_PARSE_FAILED', { purpose: 'answer_generation', parseErrorName: error instanceof Error ? error.name : 'unknown' }); throw error; }
     const providerAnswer = j.choices?.[0]?.message?.content;
+    if (i.debug && i.debugFullText) i.debug('LLM_RESPONSE_TEXT', { purpose: 'answer_generation', responseText: providerAnswer ?? null });
     const answer = providerAnswer ?? i.config.fallbackMessage;
     i.debug?.('LLM_RESPONSE_PARSED', { purpose: 'answer_generation', stream: false, responseChars: answer.length, responseTokensApprox: approxTokens(answer), emptyContent: !providerAnswer?.trim(), fallbackSubstituted: providerAnswer === undefined, choiceCount: j.choices?.length ?? 0, usage: j.usage ? { promptTokens: j.usage.prompt_tokens ?? null, completionTokens: j.usage.completion_tokens ?? null, totalTokens: j.usage.total_tokens ?? null, source: 'provider_reported' } : { promptTokensApprox: null, completionTokensApprox: approxTokens(answer), totalTokensApprox: null, source: 'partial_estimate' } });
     return answer;
@@ -207,6 +215,7 @@ export class OpenAICompatibleLlm implements LlmProvider {
       ],
     };
     const reformulationMessages = payload.messages;
+    if (i.debug && i.debugFullText) i.debug('LLM_REFORMULATION_INPUT_FULL', { provider: this.config.providerName, model: this.config.model, purpose: 'query_reformulation', stream: false, payload, serializedPayload: JSON.stringify(payload) });
     if (i.debug && i.debugDetailed) {
       const reformulationChars = reformulationMessages.reduce((total, message) => total + message.content.length, 0);
       i.debug('LLM_REFORMULATION_INPUT', { provider: this.config.providerName, model: this.config.model, historyIncluded: history.length > 0, messageCount: reformulationMessages.length, payloadChars: reformulationChars, payloadTokensApprox: approxTokens(JSON.stringify(reformulationMessages)), messages: reformulationMessages.map((m) => ({ role: m.role, chars: m.content.length, tokensApprox: approxTokens(m.content), fingerprint: fingerprint(m.content) })) });
@@ -216,7 +225,9 @@ export class OpenAICompatibleLlm implements LlmProvider {
     let j: { choices?: { message?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
     try { j = await r.json() as typeof j; }
     catch (error) { i.debug?.('LLM_REFORMULATION_PARSE_FAILED', { parseErrorName: error instanceof Error ? error.name : 'unknown' }); throw error; }
-    const query = j.choices?.[0]?.message?.content?.trim().replace(/^['\"]|['\"]$/g, '');
+    const rawReformulation = j.choices?.[0]?.message?.content;
+    if (i.debug && i.debugFullText) i.debug('LLM_REFORMULATION_RESPONSE_TEXT', { purpose: 'query_reformulation', responseText: rawReformulation ?? null });
+    const query = rawReformulation?.trim().replace(/^['\"]|['\"]$/g, '');
     i.debug?.('LLM_REFORMULATION_RESPONSE', { returned: Boolean(query && query.toUpperCase() !== 'NONE'), queryChars: query?.length ?? 0, alternativeQueryCount: query?.split(/\r?\n/).filter(Boolean).length ?? 0, emptyContent: !query, usage: j.usage ? { promptTokens: j.usage.prompt_tokens ?? null, completionTokens: j.usage.completion_tokens ?? null, totalTokens: j.usage.total_tokens ?? null, source: 'provider_reported' } : { source: 'unavailable' } });
     return query && query.toUpperCase() !== 'NONE' ? query : null;
   }
