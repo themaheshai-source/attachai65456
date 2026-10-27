@@ -105,4 +105,14 @@ describe('Advanced RAG evidence selection adapter', () => {
       'what does this assistant do service business website',
     );
   });
+
+  it('normalizes Roman-Hindi identity spelling before lexical evidence evaluation', () => {
+    expect(normalizeRetrievalQuery('tum koun ho')).toBe(
+      'assistant identity name company service business website',
+    );
+    const result = evaluateEvidence('tum koun ho', [
+      c('identity', 'AttachAI Assistant is a personalized AI assistant service for business websites.', 0.2),
+    ]);
+    expect(result.sufficient).toBe(true);
+  });
 });
