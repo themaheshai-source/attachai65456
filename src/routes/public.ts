@@ -42,7 +42,15 @@ export async function publicRoutes(app: FastifyInstance, c: Context) {
     const b = await c.pipeline.measure(telemetry, 'request.validation', 'chat_schema', async () => chatSchema.parse(req.body), { inputMetrics: { bodyType: typeof req.body } });
     const tenantId = (req as TenantRequest).tenantId;
     c.pipeline.emit(telemetry, 'pipeline.input.accepted', { stage: 'input', operation: 'chat_message', status: 'success', inputMetrics: { messageChars: b.message.length, sessionIdProvided: Boolean(b.sessionId) } });
-    return c.chat.chat(tenantId, b.message, b.sessionId, telemetry);
+    const result = await c.chat.chat(tenantId, b.message, b.sessionId, telemetry);
+    const answerCapture = c.pipeline.captureText(result.answer);
+    telemetry.deliverySummary = { deliveryBoundary: 'route_handler_return_value_pending_http_serialization', clientReceiptConfirmed: false, answerChars: result.answer.length, answerSha256: answerCapture.sha256, sourceCount: result.sources.length, conversationRef: result.conversationId ? hashKey(result.conversationId).slice(0, 12) : undefined };
+    c.pipeline.emitForensic(telemetry, 'pipeline.response.delivery', {
+      stage: 'response.delivery', operation: 'json_chat_handler_return_value', status: 'success',
+      metadata: telemetry.deliverySummary,
+      output: { answer: answerCapture, sourceCount: result.sources.length, sourceRefs: result.sources.slice(0, 25).map((source) => ({ chunkRef: hashKey(source.chunkId).slice(0, 12), sourceRef: hashKey(source.source).slice(0, 12), score: source.score })) },
+    });
+    return result;
   });
   app.post('/chat/stream', async (req, reply) => {
     const telemetry = traceFor(req, c);
@@ -64,6 +72,8 @@ export async function publicRoutes(app: FastifyInstance, c: Context) {
     const streamStarted = process.hrtime.bigint();
     let tokenEvents = 0, tokenChars = 0, firstTokenMs: number | undefined;
     let disconnected = false;
+    let streamFailed = false;
+    let finalStreamResult: Awaited<ReturnType<typeof c.chat.stream>> | undefined;
     const onClose = () => {
       if (!reply.raw.writableEnded) {
         disconnected = true;
@@ -77,17 +87,39 @@ export async function publicRoutes(app: FastifyInstance, c: Context) {
         tokenEvents++; tokenChars += token.length;
         reply.raw.write(`event: token\ndata: ${JSON.stringify({ token })}\n\n`);
       }, telemetry);
+      finalStreamResult = result;
       if (!disconnected) {
-        reply.raw.write(`event: done\ndata: ${JSON.stringify(result)}\n\n`);
+        const doneFrame = `event: done\ndata: ${JSON.stringify(result)}\n\n`;
+        const writeAccepted = reply.raw.write(doneFrame);
+        const answerCapture = c.pipeline.captureText(result.answer);
+        telemetry.deliverySummary = { deliveryBoundary: 'server_stream_write_attempted', writeAcceptedIntoBuffer: writeAccepted, clientReceiptConfirmed: false, disconnected, answerChars: result.answer.length, answerSha256: answerCapture.sha256, sourceCount: result.sources.length, tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null };
         c.pipeline.emit(telemetry, 'pipeline.stream.done_event_sent', { stage: 'response.stream', operation: 'sse_done_event', status: 'success', durationMs: Number(process.hrtime.bigint() - streamStarted) / 1_000_000, outputMetrics: { tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null, responseChars: result.answer.length, sourceCount: result.sources.length, socketWritable: reply.raw.writable } });
+        c.pipeline.emitForensic(telemetry, 'pipeline.response.delivery', {
+          stage: 'response.delivery', operation: 'sse_done_frame_write', status: 'success',
+          metadata: telemetry.deliverySummary,
+          output: { answer: answerCapture, sourceCount: result.sources.length },
+        });
+      } else {
+        telemetry.deliverySummary = { deliveryBoundary: 'not_written', clientReceiptConfirmed: false, tokenEvents, tokenChars, finalAnswerAvailable: true, answerChars: result.answer.length, answerSha256: c.pipeline.captureText(result.answer).sha256 };
+        c.pipeline.emitForensic(telemetry, 'pipeline.response.delivery', { stage: 'response.delivery', operation: 'sse_done_frame_write', status: 'cancelled', reason: 'client_disconnected_before_done_frame', metadata: telemetry.deliverySummary });
       }
     } catch (error) {
+      streamFailed = true;
+      telemetry.deliverySummary = { deliveryBoundary: 'failed_before_done_frame', clientReceiptConfirmed: false, tokenEvents, tokenChars, finalAnswerAvailable: Boolean(finalStreamResult) };
       c.pipeline.emit(telemetry, 'pipeline.stream.failed', { stage: 'response.stream', operation: 'stream_generation_and_delivery', status: disconnected ? 'cancelled' : 'failed', durationMs: Number(process.hrtime.bigint() - streamStarted) / 1_000_000, errorCode: safeErrorCode(error), outputMetrics: { tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null }, reason: disconnected ? 'connection_closed' : 'stream_error' });
       if (!disconnected && !reply.raw.destroyed) reply.raw.write(`event: error\ndata: ${JSON.stringify({ message: 'Unable to complete the response' })}\n\n`);
     } finally {
       reply.raw.off('close', onClose);
       reply.raw.end();
-      c.pipeline.emit(telemetry, 'pipeline.request.completed', { stage: 'request', operation: 'http_stream_response', status: disconnected ? 'cancelled' : reply.raw.destroyed ? 'failed' : 'success', durationMs: Number(process.hrtime.bigint() - streamStarted) / 1_000_000, outputMetrics: { httpStatus: reply.raw.statusCode, tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null, writableEnded: reply.raw.writableEnded }, reason: disconnected ? 'client_disconnected' : null });
+      const durationMs = Number(process.hrtime.bigint() - streamStarted) / 1_000_000;
+      const terminalStatus = disconnected ? 'cancelled' : streamFailed || reply.raw.destroyed ? 'failed' : 'success';
+      c.pipeline.emit(telemetry, 'pipeline.request.completed', { stage: 'request', operation: 'http_stream_response', status: terminalStatus, durationMs, outputMetrics: { httpStatus: reply.raw.statusCode, tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null, writableEnded: reply.raw.writableEnded }, reason: disconnected ? 'client_disconnected' : streamFailed ? 'stream_error' : null });
+      c.pipeline.emitForensic(telemetry, 'pipeline.trace.summary', {
+        stage: 'pipeline.trace', operation: 'summarize_sse_request', status: terminalStatus, durationMs,
+        reason: disconnected ? 'client_disconnected' : streamFailed ? 'stream_error' : null,
+        metadata: { terminalBoundary: 'sse_route_finally', httpStatus: reply.raw.statusCode, tokenEvents, tokenChars, firstTokenMs: firstTokenMs ?? null, streamEndedByServer: reply.raw.writableEnded, clientReceiptConfirmed: false, service: telemetry.traceSummary ?? null, delivery: telemetry.deliverySummary ?? null },
+        output: { finalResponseSource: telemetry.traceSummary?.finalResponseSource ?? 'unknown', answerAvailable: Boolean(finalStreamResult), clientReceiptConfirmed: false },
+      });
     }
   });
   app.post('/leads', async (req) => {
