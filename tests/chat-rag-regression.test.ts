@@ -109,6 +109,24 @@ describe('generic RAG recovery and grounding path', () => {
   });
 
   it('keeps a genuinely unknown question on the configured fallback', async () => {
+  it('returns configured fallback when initial LLM generation throws', async () => {
+    const relevant = chunk(
+      'service',
+      'AttachAI is a personalized AI assistant service for business websites.',
+      0.82,
+    );
+    const { service, llm } = fixture({
+      search: async () => [relevant],
+      answer: async () => {
+        throw new Error('LLM request failed after 1 attempt');
+      },
+    });
+
+    const result = await service.chat('tenant-a', 'What does AttachAI do?');
+    expect(result.answer).toBe('UNKNOWN');
+    expect(llm.answer).toHaveBeenCalledOnce();
+  });
+
     const { service, llm, vector } = fixture({ answer: async () => 'UNKNOWN' });
     const result = await service.chat('tenant-a', 'What is the meaning of life?');
     expect(vector.search).not.toHaveBeenCalled();
