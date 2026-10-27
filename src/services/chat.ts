@@ -56,7 +56,7 @@ type ChatTraceSummary = {
 const summaryRequest = (message: string) =>
   /\b(summarize|summary|recap|what did we discuss|what did i|what you just said|what you just told)\b/i.test(message);
 const clearlyGeneral = (message: string) =>
-  /^(hi|hello|hey|thanks|thank you|okay|ok|good morning|good afternoon|good evening|how are you|tell me a joke|what is the meaning of life)[!.? ]*$/i.test(
+  /^(?:hi|hello|hey|thanks|thank you|okay|ok|good morning|good afternoon|good evening|how are you|tell me a joke|what is the meaning of life|who are you|what are you|what(?:'s| is) your name|tell me about yourself|who created you|who developed you|what company do you belong to|which ai model are you|are you\s+\S+)[!.? ]*$/i.test(
     message.trim(),
   );
 const followUpReference = (message: string) =>
