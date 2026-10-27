@@ -1115,9 +1115,23 @@ export class ChatService {
         this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'summary_without_history', 'fallback', { reason: 'summary_empty_history', outputMetrics: { fallbackChars: fallback.length } });
         return this.finalize(prepared, this.selectAnswer(prepared, 'fallback', fallback, 'summary_empty_history'));
       }
-      const answer = await this.pipeline.measure(prepared.telemetry, 'llm.answer_generation', 'generate_conversation_summary', () => this.llm.answer(this.llmInput(prepared, message)), {
-        inputMetrics: { provider: this.llm.name, purpose: 'conversation_summary', historyMessages: prepared.history.length },
-      });
+      let answer: string;
+      try {
+        answer = await this.pipeline.measure(prepared.telemetry, 'llm.answer_generation', 'generate_conversation_summary', () => this.llm.answer(this.llmInput(prepared, message)), {
+          inputMetrics: { provider: this.llm.name, purpose: 'conversation_summary', historyMessages: prepared.history.length },
+        });
+      } catch (error) {
+        const summary = this.traceSummary(prepared.telemetry);
+        const failedStage = 'llm.answer_generation.generate_conversation_summary';
+        if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+        const fallback = tenantFallback(prepared.client);
+        const selectedFallback = this.selectAnswer(prepared, 'fallback', fallback, 'summary_provider_failure');
+        this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'summary_provider_failure', 'fallback', {
+          reason: safeErrorCode(error),
+          outputMetrics: { fallbackChars: fallback.length, providerFailure: safeErrorCode(error), failedStage },
+        });
+        return this.finalize(prepared, selectedFallback);
+      }
       this.traceSummary(prepared.telemetry).initialAnswerGenerated = true;
       return this.finalize(prepared, this.selectAnswer(prepared, 'summary', answer, 'conversation_summary_generated'));
     }
@@ -1158,9 +1172,16 @@ export class ChatService {
           inputMetrics: { provider: this.llm.name, purpose: 'conversation_summary', streaming: true, historyMessages: prepared.history.length },
         });
       } catch (error) {
-        this.traceSummary(prepared.telemetry).failedStages.push('llm.answer_generation.stream_conversation_summary_buffered');
-        this.emitTraceSummary(prepared, 'failed', streamedSummary, safeErrorCode(error));
-        throw error;
+        const summary = this.traceSummary(prepared.telemetry);
+        const failedStage = 'llm.answer_generation.stream_conversation_summary_buffered';
+        if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+        const fallback = this.selectAnswer(prepared, 'fallback', tenantFallback(prepared.client), 'stream_summary_provider_failure');
+        this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'stream_summary_provider_failure', 'fallback', {
+          reason: safeErrorCode(error),
+          outputMetrics: { fallbackChars: fallback.length, providerFailure: safeErrorCode(error), failedStage },
+        });
+        for (const token of answerTokens(fallback)) onToken(token);
+        return this.finalize(prepared, fallback);
       }
       const cleanedSummary = cleanAnswerScaffolding(streamedSummary);
       this.traceSummary(prepared.telemetry).initialAnswerGenerated = true;
@@ -1191,9 +1212,16 @@ export class ChatService {
         inputMetrics: { provider: this.llm.name, purpose: 'answer_generation', streaming: true, bufferedBeforeClientDelivery: true, contextChunks: prepared.found.length },
       });
     } catch (error) {
-      this.traceSummary(prepared.telemetry).failedStages.push('llm.answer_generation.stream_answer_buffered_until_grounding');
-      this.emitTraceSummary(prepared, 'failed', streamed, safeErrorCode(error));
-      throw error;
+      const summary = this.traceSummary(prepared.telemetry);
+      const failedStage = 'llm.answer_generation.stream_answer_buffered_until_grounding';
+      if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+      const fallback = this.selectAnswer(prepared, 'fallback', prepared.client.config.fallbackMessage, 'stream_llm_provider_failure');
+      this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'stream_llm_provider_failure', 'fallback', {
+        reason: safeErrorCode(error),
+        outputMetrics: { fallbackChars: fallback.length, providerFailure: safeErrorCode(error), failedStage },
+      });
+      for (const token of answerTokens(fallback)) onToken(token);
+      return this.finalize(prepared, fallback);
     }
     const answerBeforeClean = streamed;
     this.traceSummary(prepared.telemetry).initialAnswerGenerated = true;
@@ -1219,9 +1247,17 @@ export class ChatService {
           inputMetrics: { provider: this.llm.name, purpose: 'grounding_correction', streaming: false, correctionReasonCount: check.reasons.length, originalStream: true },
         });
       } catch (error) {
-        this.traceSummary(prepared.telemetry).failedStages.push('llm.grounding_correction.generate_stream_correction_nonstreaming');
-        this.emitTraceSummary(prepared, 'failed', answer, safeErrorCode(error));
-        throw error;
+        const summary = this.traceSummary(prepared.telemetry);
+        const failedStage = 'llm.grounding_correction.generate_stream_correction_nonstreaming';
+        if (!summary.failedStages.includes(failedStage)) summary.failedStages.push(failedStage);
+        // The initial streamed answer failed grounding. Never send it as a fallback.
+        const fallback = this.selectAnswer(prepared, 'fallback', prepared.client.config.fallbackMessage, 'stream_correction_provider_failure');
+        this.emit(prepared.telemetry, 'pipeline.fallback.selected', 'answer.fallback', 'stream_correction_provider_failure', 'fallback', {
+          reason: safeErrorCode(error),
+          outputMetrics: { fallbackChars: fallback.length, providerFailure: safeErrorCode(error), failedStage },
+        });
+        for (const token of answerTokens(fallback)) onToken(token);
+        return this.finalize(prepared, fallback);
       }
       const corrected = cleanAnswerScaffolding(correctedRaw);
       this.pipeline.emitForensic(prepared.telemetry, 'pipeline.answer.corrected.raw', { stage: 'grounding.correction', operation: 'capture_stream_correction_return_value', status: 'success', metadata: { provider: this.llm.name, answerChars: correctedRaw.length }, output: { answer: this.pipeline.captureText(correctedRaw) } });
