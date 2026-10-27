@@ -32,3 +32,46 @@ describe('bounded grounding validation', () => {
     expect(validateGrounding('What is Gousto’s delivery fee?', 'The delivery fee is $3.99.', chunk('Delivery is publicly listed as £3.99.')).ok).toBe(false);
   });
 });
+
+describe('grounding forensic boundary diagnostics', () => {
+  it('captures the exact validator arguments and emits individual existing rule results', () => {
+    const question = '  What is the price?\n';
+    const answer = 'It costs 12.  \n';
+    const evidence = [{ id: 'chunk-1', source: ' tenant.md ', score: 0.91, text: 'Price: 12.\nAvailability may vary by location.  ' }];
+    let actualInput: unknown;
+    const rules: Array<{ name: string; status: string; result: boolean | null; reason: string }> = [];
+    let actualOutput: unknown;
+    const result = validateGrounding(question, answer, evidence, {
+      onInput: (input) => { actualInput = input; },
+      onRule: (rule) => { rules.push({ name: rule.name, status: rule.status, result: rule.result, reason: rule.reason }); },
+      onOutput: (output) => { actualOutput = output; },
+    });
+
+    expect(actualInput).toEqual({ question, answer, evidence });
+    expect((actualInput as { question: string }).question).toBe(question);
+    expect((actualInput as { answer: string }).answer).toBe(answer);
+    expect((actualInput as { evidence: typeof evidence }).evidence[0]?.text).toBe(evidence[0]?.text);
+    expect(rules.map((rule) => rule.name)).toEqual([
+      'evidence_present',
+      'unsupported_numeric_claims',
+      'answer_overrides_relevant_unknown_evidence',
+      'unnecessary_refusal',
+      'possible_negative_evidence_contradiction',
+      'dropped_evidence_qualification',
+    ]);
+    expect(rules.every((rule) => ['passed', 'failed', 'skipped', 'error'].includes(rule.status))).toBe(true);
+    expect(actualOutput).toMatchObject({ ...result, classification: result.ok ? 'accepted' : 'rejected_by_grounding_rules', status: result.ok ? 'success' : 'rejected' });
+  });
+
+  it('reports a rule-level error and final validator failure if evaluation throws', () => {
+    const ruleEvents: Array<{ name: string; status: string }> = [];
+    let outputStatus: string | undefined;
+    expect(() => validateGrounding('q', 'a', null as never, {
+      onRule: (rule) => ruleEvents.push({ name: rule.name, status: rule.status }),
+      onOutput: (output) => { outputStatus = output.status; },
+    })).toThrow();
+    expect(ruleEvents).toContainEqual({ name: 'evidence_present', status: 'error' });
+    expect(outputStatus).toBe('failed');
+  });
+});
+
