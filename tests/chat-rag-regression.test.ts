@@ -121,6 +121,35 @@ describe('generic RAG recovery and grounding path', () => {
     expect(result.answer).toBe('UNKNOWN');
   });
 
+  it('answers configured tenant identity across chat, preview, and streaming without an LLM call', async () => {
+    const { service, llm } = fixture();
+    const chat = await service.chat('tenant-a', 'tum koun ho');
+    expect(chat.answer).toContain("Tenant A's AI assistant, A");
+    expect(llm.answer).not.toHaveBeenCalled();
+
+    const preview = await service.preview('tenant-a', 'aap kaun hain?', 'Preview prompt');
+    expect(preview.answer).toContain("Tenant A's AI assistant, A");
+
+    const tokens: string[] = [];
+    const streamed = await service.stream('tenant-a', 'what is your name', undefined, (token) => tokens.push(token));
+    expect(streamed.answer).toContain("Tenant A's AI assistant, A");
+    expect(tokens.join('')).toBe(streamed.answer);
+    expect(llm.streamAnswer).not.toHaveBeenCalled();
+  });
+
+  it('keeps configured identity tenant-specific', async () => {
+    const { service, repo } = fixture();
+    repo.getClient.mockResolvedValue({
+      ...client,
+      id: 'tenant-b',
+      name: 'Tenant B',
+      config: { ...client.config, assistantName: 'B', companyName: 'Tenant B' },
+    });
+    const result = await service.chat('tenant-b', 'who are you?');
+    expect(result.answer).toContain("Tenant B's AI assistant, B");
+    expect(result.answer).not.toContain('Tenant A');
+  });
+
   it('returns configured fallback when initial LLM generation throws', async () => {
     const relevant = chunk(
       'service',
