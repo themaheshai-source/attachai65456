@@ -205,4 +205,41 @@ describe('generic LLM provider configuration and adapter', () => {
     });
     expect(JSON.stringify(health)).not.toContain('test-only-key');
   });
+
+  it('exposes the exact assembled provider payload and raw response only through the opt-in debug callback', async () => {
+    const events: Array<{ stage: string; data: Record<string, unknown> }> = [];
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ choices: [{ message: { content: '  raw answer\n' } }] }));
+    const provider = createLlmProvider(loadLlmConfig(input), fetchMock);
+    await expect(provider.answer({
+      ...answerInput,
+      debugFullText: true,
+      debug: (stage, data) => events.push({ stage, data }),
+    })).resolves.toBe('  raw answer\n');
+
+    const requestBody = String((fetchMock.mock.calls[0]![1] as RequestInit).body);
+    const assembled = events.find((event) => event.stage === 'LLM_INPUT_BOUNDARY_FULL');
+    expect(assembled?.data.serializedPayload).toBe(requestBody);
+    expect(assembled?.data.payload).toEqual(JSON.parse(requestBody));
+    const userMessage = (JSON.parse(requestBody) as { messages: Array<{ role: string; content: string }> }).messages.at(-1);
+    expect(userMessage?.content).toContain('Question: What?');
+    expect(events.find((event) => event.stage === 'LLM_RESPONSE_TEXT')?.data.responseText).toBe('  raw answer\n');
+    expect(JSON.stringify(events)).not.toContain('test-only-key');
+    expect(JSON.stringify(events)).not.toContain('authorization');
+  });
+
+  it('captures the untrimmed reformulation response separately from the selected query', async () => {
+    const events: Array<{ stage: string; data: Record<string, unknown> }> = [];
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ choices: [{ message: { content: ' first alternative \nsecond alternative\n' } }] }));
+    const provider = createLlmProvider(loadLlmConfig(input), fetchMock);
+    const query = await provider.reformulate?.({
+      ...answerInput,
+      debugFullText: true,
+      debug: (stage, data) => events.push({ stage, data }),
+    });
+    expect(query).toBe('first alternative \nsecond alternative');
+    expect(events.find((event) => event.stage === 'LLM_REFORMULATION_RESPONSE_TEXT')?.data.responseText).toBe(' first alternative \nsecond alternative\n');
+    const assembled = events.find((event) => event.stage === 'LLM_REFORMULATION_INPUT_FULL');
+    expect(assembled?.data.serializedPayload).toBe(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
+  });
+
 });
