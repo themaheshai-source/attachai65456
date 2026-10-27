@@ -214,7 +214,15 @@ export async function adminRoutes(app: FastifyInstance, c: Context) {
     const context = preview.retrieval.evidence;
     c.pipeline.emit(telemetry, 'pipeline.preview.retrieval.completed', { stage: 'retrieval', operation: 'prompt_preview_retrieval', status: 'success', outputMetrics: { retrievedChunks: context.length, evidenceStatus: preview.retrieval.decision.status, sufficient: preview.retrieval.decision.sufficient, sourceCount: new Set(context.map((chunk) => chunk.source)).size, chunkRefs: context.slice(0, 20).map((chunk) => ({ chunkRef: safeRef(chunk.id), sourceRef: safeRef(chunk.source), score: chunk.score })) } });
     const sources = context.map((chunk) => ({ source: chunk.source, score: Math.round(chunk.score * 1000) / 1000, chunkId: chunk.id }));
-    return { answer: preview.answer, retrieval: { count: context.length, sources }, sources };
+    const response = { answer: preview.answer, retrieval: { count: context.length, sources }, sources };
+    const answerCapture = c.pipeline.captureText(response.answer);
+    telemetry.deliverySummary = { deliveryBoundary: 'admin_route_handler_return_value_pending_http_serialization', clientReceiptConfirmed: false, answerChars: response.answer.length, answerSha256: answerCapture.sha256, retrievedChunkCount: context.length, sourceCount: sources.length, tenantRef: safeRef(id) };
+    c.pipeline.emitForensic(telemetry, 'pipeline.response.delivery', {
+      stage: 'response.delivery', operation: 'prompt_preview_handler_return_value', status: 'success',
+      metadata: telemetry.deliverySummary,
+      output: { answer: answerCapture, sourceRefs: sources.slice(0, 25).map((source) => ({ chunkRef: safeRef(source.chunkId), sourceRef: safeRef(source.source), score: source.score })) },
+    });
+    return response;
   });
   app.post('/clients/:id/prompt', async (req) => {
     const { id } = idParams.parse(req.params),
