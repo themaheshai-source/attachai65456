@@ -114,7 +114,11 @@ export class OpenAICompatibleLlm implements LlmProvider {
         const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
         const timeout = controller.signal.aborted;
         debug?.('LLM_HTTP_ATTEMPT_FAILED', { callId, purpose, attemptNumber: attempt + 1, maxAttempts: retries + 1, durationMs, errorCategory: timeout ? 'timeout' : error instanceof Error ? error.name : 'unknown', timeout });
-        if (attempt === retries) throw new Error(`LLM request failed after ${attempt + 1} attempt(s)`, { cause: error });
+        // A timeout is a latency failure, not a transient HTTP response. Do not
+        // spend another full timeout window repeating the same slow request.
+        if (attempt === retries || timeout) {
+          throw new Error(`LLM request failed after ${attempt + 1} attempt(s)`, { cause: error });
+        }
         const delayMs = this.config.retryBaseMs * 2 ** attempt;
         debug?.('LLM_RETRY_SCHEDULED', { callId, purpose, attemptNumber: attempt + 1, nextAttemptNumber: attempt + 2, maxAttempts: retries + 1, delayMs, retryReason: timeout ? 'timeout' : 'network_error' });
       } finally { clearTimeout(timer); }
