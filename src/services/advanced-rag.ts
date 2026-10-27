@@ -58,7 +58,30 @@ const CONTEXT_CHARS = 7000;
 export const tokens = (value: string) =>
   (value.toLowerCase().match(/[\p{L}\p{N}_/-]+/gu) ?? [])
     .map((token) => SYNONYMS[token] ?? token)
-    .filter((token) => !STOPWORDS.has(token));
+    .filter((token) => token.length > 1 && !STOPWORDS.has(token));
+
+/**
+ * Normalize a small set of common service-intent phrasings for lexical/BM25
+ * retrieval. This is targeted query normalization, not a general translator.
+ */
+export function normalizeRetrievalQuery(query: string): string {
+  const trimmed = query.trim();
+
+  if (/\b(?:tum|tu|aap|ap)\b.*\b(?:kya|kaam)\b.*\b(?:karte|karta|karti|kar)\b/i.test(trimmed)) {
+    return 'what does this assistant do service business website';
+  }
+
+  const serviceIntent = /^what\s+does\s+(.+?)\s+(?:do|offer|provide)[?.!]*$/i.exec(trimmed);
+  if (serviceIntent) {
+    const subject = serviceIntent[1] ?? '';
+    // Avoid turning questions about people into company-service questions.
+    if (!/\b(?:founder|owner|person|he|she|they|someone)\b/i.test(subject)) {
+      return `${trimmed} service assistant business website`;
+    }
+  }
+
+  return trimmed;
+}
 const overlap = (query: Set<string>, text: string) => {
   const docTokens = new Set(tokens(text));
   return [...query].filter((token) => docTokens.has(token)).length;
@@ -186,24 +209,31 @@ export function bm25Search(query: string, chunks: RetrievedChunk[], limit = RETR
 }
 
 export function evaluateEvidence(query: string, chunks: RetrievedChunk[]): EvidenceDecision {
-  const queryTerms = new Set(tokens(query));
-  const coverage = Math.max(
+  const normalizedQuery = normalizeRetrievalQuery(query);
+  const queryTerms = new Set(tokens(normalizedQuery));
+  const bestMatchedTerms = Math.max(
     0,
-    ...chunks.map((chunk) => overlap(queryTerms, chunk.text) / Math.max(1, queryTerms.size)),
+    ...chunks.map((chunk) => overlap(queryTerms, chunk.text)),
   );
+  const coverage = bestMatchedTerms / Math.max(1, queryTerms.size);
   const exact =
     comparable(query).length > 0 &&
     chunks.some((chunk) => comparable(chunk.text).includes(comparable(query)));
-  const strong = chunks.filter((chunk) => chunk.score >= 0.2).length;
-  const topScore = Math.max(0, ...chunks.map((chunk) => chunk.score));
-  const status: EvidenceStatus =
-    exact || coverage >= 0.55 || strong >= 2 || topScore >= 0.5
-      ? 'SUPPORTED'
-      : (coverage >= 0.2 || topScore >= 0.2) && chunks.length
-        ? 'PARTIALLY_SUPPORTED'
-        : coverage > 0 && chunks.length
-          ? 'UNCERTAIN'
-          : 'NOT_SUPPORTED';
+
+  // Similarity can retrieve candidates, but it cannot by itself prove that a
+  // chunk answers the question. Require multiple question terms to be present.
+  const hasMultipleIntentTerms = queryTerms.size >= 2 && bestMatchedTerms >= 2;
+  const supportedByIntent = hasMultipleIntentTerms && coverage >= 0.65;
+  const partialByIntent = hasMultipleIntentTerms && coverage >= 0.35;
+
+  const status: EvidenceStatus = exact || supportedByIntent
+    ? 'SUPPORTED'
+    : partialByIntent
+      ? 'PARTIALLY_SUPPORTED'
+      : coverage > 0 && chunks.length > 0
+        ? 'UNCERTAIN'
+        : 'NOT_SUPPORTED';
+
   return {
     status,
     coverage,
@@ -212,8 +242,6 @@ export function evaluateEvidence(query: string, chunks: RetrievedChunk[]): Evide
     sufficient: status === 'SUPPORTED' || status === 'PARTIALLY_SUPPORTED',
   };
 }
-
-function profile(chunks: RetrievedChunk[]) {
   const frequencies = new Map<string, number>();
   for (const chunk of chunks)
     for (const term of tokens(chunk.text).filter((term) => term.length > 2))
@@ -362,6 +390,7 @@ export async function retrieveAdvancedEvidence(input: {
   const combinedCorpusCount = input.dense.length + input.corpus.length;
   const corpus = deduplicate([...input.dense, ...input.corpus]);
   const corpusProfile = profile(corpus);
+  const retrievalQuestion = normalizeRetrievalQuery(input.question);
   if (input.onDiagnostic) diagnostic('corpus_profile', { durationMs: elapsedMs(profileStarted), inputDenseCount: input.dense.length, inputCorpusCount: input.corpus.length, combinedCorpusCount, distinctCorpusCount: corpus.length, duplicateCount: combinedCorpusCount - corpus.length, documentCount: corpusProfile.documents, vocabularyCount: corpusProfile.vocabulary });
   const run = (query: string, dense: RetrievedChunk[]) => {
     const runStarted = process.hrtime.bigint();
@@ -414,14 +443,34 @@ export async function retrieveAdvancedEvidence(input: {
     const exactQueryMatch = queryComparable.length > 0 && chunks.some((chunk) => comparable(chunk.text).includes(queryComparable));
     const strongChunkCount = chunks.filter((chunk) => chunk.score >= 0.2).length;
     const topScore = Math.max(0, ...chunks.map((chunk) => chunk.score));
-    const reason = exactQueryMatch ? 'exact_query_match'
-      : currentDecision.coverage >= 0.55 ? 'query_coverage_at_least_0_55'
-        : strongChunkCount >= 2 ? 'at_least_two_chunks_scored_0_2_or_higher'
-          : topScore >= 0.5 ? 'top_chunk_score_at_least_0_5'
-            : (currentDecision.coverage >= 0.2 || topScore >= 0.2) && chunks.length ? 'partial_support_threshold_met'
-              : currentDecision.coverage > 0 && chunks.length ? 'nonzero_query_coverage_without_support_threshold'
-                : 'no_evidence_met_support_thresholds';
-    return { ...currentDecision, reason, exactQueryMatch, strongChunkCount, topScore, thresholds: { queryCoverageSupported: 0.55, strongChunkScore: 0.2, minimumStrongChunks: 2, topScoreSupported: 0.5, queryCoveragePartial: 0.2, topScorePartial: 0.2 } };
+    const normalizedTerms = new Set(tokens(normalizeRetrievalQuery(query)));
+    const bestMatchedTerms = Math.max(
+      0,
+      ...chunks.map((chunk) => overlap(normalizedTerms, chunk.text)),
+    );
+    const reason = exactQueryMatch
+      ? 'exact_query_match'
+      : currentDecision.status === 'SUPPORTED'
+        ? 'question_intent_supported_by_multiple_terms'
+        : currentDecision.status === 'PARTIALLY_SUPPORTED'
+          ? 'partial_question_intent_supported'
+          : currentDecision.coverage > 0 && chunks.length > 0
+            ? 'insufficient_question_intent_coverage'
+            : 'no_evidence_matched_question_intent';
+    return {
+      ...currentDecision,
+      reason,
+      exactQueryMatch,
+      strongChunkCount,
+      topScore,
+      bestMatchedTerms,
+      thresholds: {
+        queryCoverageSupported: 0.65,
+        minimumMatchedTermsSupported: 2,
+        queryCoveragePartial: 0.35,
+        minimumMatchedTermsPartial: 2,
+      },
+    };
   };
   let decisionDiagnostics = input.onDiagnostic ? explainDecision(input.question, selected, decision) : undefined;
   if (input.onDiagnostic) diagnostic('context_selection', { durationMs: elapsedMs(contextStarted), query: input.question, candidateCount: first.ranked.length, selectedCount: selected.length, selectedChars: selected.reduce((sum, chunk) => sum + chunk.text.length, 0), contextCharacterLimit: CONTEXT_CHARS, selectionDecisions: selectionDecisions ?? [], selected: selected.map((chunk, index) => ({ rank: index + 1, id: chunk.id, source: chunk.source, score: chunk.score, textChars: chunk.text.length, text: chunk.text })), decision, decisionDiagnostics });
