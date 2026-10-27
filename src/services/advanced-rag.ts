@@ -46,6 +46,9 @@ const SYNONYMS: Record<string, string> = {
   boxes: 'box',
   sizes: 'size',
   services: 'service',
+  assistants: 'assistant',
+  businesses: 'business',
+  websites: 'website',
 };
 const MAX_CANDIDATES = 40;
 const RETRIEVAL_K = 20;
@@ -401,7 +404,7 @@ export async function retrieveAdvancedEvidence(input: {
     }
     return { exact, keyword, bm25, fused, ranked };
   };
-  const first = run(input.question, input.dense);
+  const first = run(retrievalQuestion, input.dense);
   let contextStarted = process.hrtime.bigint();
   let selectionDecisions: SelectionDiagnostic[] | undefined = input.onDiagnostic ? [] : undefined;
   let selected = selectContext(first.ranked, selectionDecisions ? (item) => selectionDecisions!.push(item) : undefined);
@@ -430,7 +433,7 @@ export async function retrieveAdvancedEvidence(input: {
     dense: input.dense.length,
     fused: first.fused.length,
   };
-  const queryTerms = new Set(tokens(input.question));
+  const queryTerms = new Set(tokens(retrievalQuestion));
   const seedChunks = first.fused.filter(
     (chunk) => overlap(queryTerms, chunk.text) > 0 || (denseScores.get(chunk.id) ?? 0) >= 0.2,
   );
@@ -440,14 +443,14 @@ export async function retrieveAdvancedEvidence(input: {
   ) {
     expanded = true;
     const expansionStarted = process.hrtime.bigint();
-    const query = expandedQuery(input.question, seedChunks);
+    const query = expandedQuery(retrievalQuestion, seedChunks);
     if (input.onDiagnostic) diagnostic('query_expansion', { durationMs: elapsedMs(expansionStarted), executed: true, reason: 'initial_evidence_uncertain_or_not_supported_with_seed_candidates', query: input.question, expandedQuery: query, seedCount: seedChunks.length, inputQueryChars: input.question.length, expandedQueryChars: query.length, expandedByChars: Math.max(0, query.length - input.question.length) });
     const second = run(query, []);
     contextStarted = process.hrtime.bigint();
     selectionDecisions = input.onDiagnostic ? [] : undefined;
     selected = selectContext(
       rerank(
-        input.question,
+        retrievalQuestion,
         rrf([first.fused, second.keyword, second.bm25]),
         corpusProfile.topTerms,
         denseScores,
