@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { cleanAnswerScaffolding, selectFocusedEvidence } from '../src/services/advanced-rag.js';
+import {
+  cleanAnswerScaffolding,
+  evaluateEvidence,
+  normalizeRetrievalQuery,
+  selectFocusedEvidence,
+} from '../src/services/advanced-rag.js';
 
 type C = { id: string; text: string; source: string; score: number };
 const c = (id: string, text: string, score: number): C => ({ id, text, source: 'tenant.md', score });
