@@ -104,17 +104,50 @@ export function exactSearch(query: string, chunks: RetrievedChunk[], limit = RET
   return results;
 }
 
-export function keywordSearch(query: string, chunks: RetrievedChunk[], limit = RETRIEVAL_K, onRank?: SearchRankCallback) {
+export function keywordSearch(
+  query: string,
+  chunks: RetrievedChunk[],
+  limit = RETRIEVAL_K,
+  onRank?: SearchRankCallback,
+) {
   const queryTerms = new Set(tokens(query));
-  const ranked = byScore(
-    chunks
-      .map((chunk) => ({ chunk, hits: overlap(queryTerms, chunk.text) }))
-      .filter((x) => x.hits > 0)
-      .map((x) => ({ chunk: x.chunk, score: x.hits + x.chunk.text.length / 1_000_000, hits: x.hits })),
-  ).slice(0, limit);
+
+  const ranked = chunks
+    .map((chunk) => ({
+      chunk,
+      hits: overlap(queryTerms, chunk.text),
+    }))
+    .filter((item) => item.hits > 0)
+    .map((item) => ({
+      chunk: item.chunk,
+      score: item.hits + item.chunk.text.length / 1_000_000,
+      hits: item.hits,
+    }))
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.chunk.id.localeCompare(b.chunk.id),
+    )
+    .slice(0, limit);
+
   try {
-    onRank?.(ranked.map((item, index) => ({ rank: index + 1, id: item.chunk.id, source: item.chunk.source, rankingScore: item.score, rankingScoreType: 'keyword_hits_plus_length_tiebreaker', sourceChunkScore: item.chunk.score, matchType: 'keyword_overlap', keywordHits: item.hits })));
-  } catch { /* Diagnostics do not alter retrieval behavior. */ }
+    onRank?.(
+      ranked.map((item, index) => ({
+        rank: index + 1,
+        id: item.chunk.id,
+        source: item.chunk.source,
+        rankingScore: item.score,
+        rankingScoreType:
+          'keyword_hits_plus_length_tiebreaker',
+        sourceChunkScore: item.chunk.score,
+        matchType: 'keyword_overlap',
+        keywordHits: item.hits,
+      })),
+    );
+  } catch {
+    /* Diagnostics must not alter retrieval behavior. */
+  }
+
   return ranked.map((item) => item.chunk);
 }
 
