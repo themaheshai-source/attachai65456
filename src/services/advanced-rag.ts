@@ -242,6 +242,7 @@ export function evaluateEvidence(query: string, chunks: RetrievedChunk[]): Evide
     sufficient: status === 'SUPPORTED' || status === 'PARTIALLY_SUPPORTED',
   };
 }
+function profile(chunks: RetrievedChunk[]) {
   const frequencies = new Map<string, number>();
   for (const chunk of chunks)
     for (const term of tokens(chunk.text).filter((term) => term.length > 2))
