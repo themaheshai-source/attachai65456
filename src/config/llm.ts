@@ -135,7 +135,7 @@ export function loadLlmConfig(input: NodeJS.ProcessEnv): LlmConfig {
         input.LLM_MAX_TOKENS === undefined ? undefined : integer(input.LLM_MAX_TOKENS, 1024),
     },
     stream: bool(input.LLM_STREAM, false),
-    timeoutMs: integer(input.LLM_TIMEOUT_MS, 15000),
+    timeoutMs: integer(input.LLM_TIMEOUT_MS, 60000),
     maxRetries: integer(input.LLM_MAX_RETRIES, 2),
     retryBaseMs: integer(input.LLM_RETRY_BASE_MS, 250),
     headers,
