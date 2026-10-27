@@ -13,12 +13,46 @@ export type PipelineStatus =
   | 'cancelled';
 
 export type ProviderDiagnostic = (operation: string, data: Record<string, unknown>) => void;
+export type PipelineDebugLevel = 'debug' | 'info' | 'warn' | 'error';
+export type PipelineDebugConfig = {
+  enabled: boolean;
+  level: PipelineDebugLevel;
+  fullText: boolean;
+  maxTextChars: number;
+};
+export type ForensicText = {
+  value: string | null;
+  originalCharacterCount: number;
+  loggedCharacterCount: number;
+  sha256: string;
+  fullTextLoggingEnabled: boolean;
+  truncated: boolean;
+  redactionsApplied: number;
+  complete: boolean;
+  omissionReason?: 'full_text_logging_disabled';
+};
+export type ForensicEvent = {
+  stage: string;
+  operation: string;
+  status: PipelineStatus;
+  attempt?: number;
+  durationMs?: number;
+  reason?: string | null;
+  errorCode?: string | null;
+  snapshotId?: string;
+  metadata?: Record<string, unknown>;
+  input?: Record<string, unknown>;
+  output?: Record<string, unknown>;
+};
 
 export type PipelineContext = {
   requestId: string;
   traceId: string;
   entryPoint: string;
   tenantRef?: string;
+  /** Safe lifecycle metadata retained until the transport boundary completes. */
+  traceSummary?: Record<string, unknown>;
+  deliverySummary?: Record<string, unknown>;
 };
 
 export type PipelineEvent = {
@@ -37,6 +71,7 @@ export type PipelineEvent = {
 };
 
 type LogSink = {
+  debug?: (obj: Record<string, unknown>, message?: string) => unknown;
   info?: (obj: Record<string, unknown>, message?: string) => unknown;
   warn?: (obj: Record<string, unknown>, message?: string) => unknown;
   error?: (obj: Record<string, unknown>, message?: string) => unknown;
@@ -48,6 +83,8 @@ const contentField = /^(?:prompt|content|answer|question|query|text|history|body
 const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const phonePattern = /(?:\+?\d[\d ()-]{7,}\d)/g;
 const secretPattern = /\b(?:sk|pk)-[A-Za-z0-9_-]{12,}\b|\b(?:Bearer\s+)[A-Za-z0-9._~-]{8,}/gi;
+const credentialAssignmentPattern = /((?:["']?\b(?:api[-_ ]?key|admin[-_ ]?api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|password|secret|authorization|proxy-authorization|cookie|set-cookie|credential|credentials)\b["']?)\s*[:=]\s*["']?)([^"'&,\s;}\]]+)/gi;
+const diagnosticLevelRank: Record<PipelineDebugLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 export function safeRef(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
@@ -112,7 +149,99 @@ export class PipelineObserver {
   constructor(
     private readonly sink: LogSink,
     readonly mode: DiagnosticMode = 'basic',
+    readonly debugConfig: PipelineDebugConfig = {
+      enabled: true,
+      level: 'info',
+      fullText: false,
+      maxTextChars: 12000,
+    },
   ) {}
+
+  get fullTextEnabled() {
+    return this.mode !== 'off' && this.debugConfig.enabled && this.debugConfig.fullText;
+  }
+
+  captureText(value: string): ForensicText {
+    const sha256 = crypto.createHash('sha256').update(value).digest('hex');
+    if (!this.fullTextEnabled) {
+      return {
+        value: null,
+        originalCharacterCount: value.length,
+        loggedCharacterCount: 0,
+        sha256,
+        fullTextLoggingEnabled: false,
+        truncated: false,
+        redactionsApplied: 0,
+        complete: false,
+        omissionReason: 'full_text_logging_disabled',
+      };
+    }
+    let redactionsApplied = 0;
+    let safe = value.replace(secretPattern, () => {
+      redactionsApplied++;
+      return '[REDACTED_SECRET]';
+    });
+    safe = safe.replace(credentialAssignmentPattern, (_match, prefix: string, _value: string, suffix: string) => {
+      redactionsApplied++;
+      return `${prefix}[REDACTED_SECRET]${suffix}`;
+    });
+    const maxChars = Math.max(128, Math.min(200000, Math.floor(this.debugConfig.maxTextChars)));
+    const truncated = safe.length > maxChars;
+    const text = truncated ? safe.slice(0, maxChars) : safe;
+    return {
+      value: text,
+      originalCharacterCount: value.length,
+      loggedCharacterCount: text.length,
+      sha256,
+      fullTextLoggingEnabled: true,
+      truncated,
+      redactionsApplied,
+      complete: !truncated && redactionsApplied === 0,
+    };
+  }
+
+  /** Emit a content-aware forensic record. Text must be wrapped with captureText first. */
+  emitForensic(context: PipelineContext, event: string, data: ForensicEvent) {
+    if (this.mode === 'off' || !this.debugConfig.enabled) return;
+    const configuredRank = diagnosticLevelRank[this.debugConfig.level];
+    const preferredLevel: PipelineDebugLevel = data.status === 'failed' || data.status === 'rejected'
+      ? 'error'
+      : data.status === 'fallback' || data.status === 'retrying' || data.status === 'cancelled'
+        ? 'warn'
+        : 'info';
+    if (diagnosticLevelRank[preferredLevel] < configuredRank) return;
+    const level = preferredLevel;
+    const parentSpanId = this.activeSpan.getStore();
+    const record: Record<string, unknown> = {
+      timestamp: new Date().toISOString(),
+      level,
+      event: event.slice(0, 120),
+      requestId: context.requestId,
+      traceId: context.traceId,
+      ...(parentSpanId ? { parentSpanId } : {}),
+      spanId: crypto.randomUUID(),
+      entryPoint: context.entryPoint,
+      ...(context.tenantRef ? { tenantRef: context.tenantRef } : {}),
+      stage: data.stage.slice(0, 100),
+      operation: data.operation.slice(0, 100),
+      status: data.status,
+      ...(data.attempt === undefined ? {} : { attempt: data.attempt }),
+      ...(data.durationMs === undefined ? {} : { durationMs: Math.max(0, Math.round(data.durationMs * 100) / 100) }),
+      ...(data.reason === undefined ? {} : { reason: data.reason === null ? null : redactString(data.reason) }),
+      ...(data.errorCode === undefined ? {} : { errorCode: data.errorCode }),
+      ...(data.snapshotId ? { snapshotId: data.snapshotId } : {}),
+      fullTextLoggingEnabled: this.fullTextEnabled,
+      ...(data.metadata ? { metadata: sanitize(data.metadata) } : {}),
+      ...(data.input ? { input: data.input } : {}),
+      ...(data.output ? { output: data.output } : {}),
+    };
+    try {
+      const logger = this.sink[level] ?? this.sink.info;
+      if (logger) logger.call(this.sink, record, event);
+    } catch {
+      // Forensic logging must never alter application behavior.
+    }
+  }
 
   createContext(input: {
     requestId?: unknown;
