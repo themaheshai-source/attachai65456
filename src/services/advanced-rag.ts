@@ -67,6 +67,12 @@ export const tokens = (value: string) =>
 export function normalizeRetrievalQuery(query: string): string {
   const trimmed = query.trim();
 
+  // Preserve the original question for generation, while giving retrieval and
+  // lexical evidence evaluation stable terms for identity wording variations.
+  if (/^(?:(?:tum|tu|aap|ap)\s+(?:kaun|koun)\s+(?:ho|hain|hai)|(?:tumhara|aapka|apka)\s+naam\s+(?:kya|kia)\s+(?:hai|he)|who\s+are\s+you|what\s+(?:are\s+you|is\s+your\s+name)|tell\s+me\s+about\s+yourself)[?.! ]*$/i.test(trimmed)) {
+    return 'assistant identity name company service business website';
+  }
+
   if (/\b(?:tum|tu|aap|ap)\b.*\b(?:kya|kaam)\b.*\b(?:karte|karta|karti|kar)\b/i.test(trimmed)) {
     return 'what does this assistant do service business website';
   }
