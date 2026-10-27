@@ -29,6 +29,31 @@ describe('Advanced RAG evidence selection adapter', () => {
   });
 
   it('bounds selected context and deduplicates equivalent chunks', () => {
+
+  it('does not treat high scores and a shared founder term as support for an unknown favorite color', () => {
+    const result = evaluateEvidence("What is the founder's favorite color?", [
+      c('founder', 'Founder / creator: Mahesh Editor. AttachAI is a personalized AI assistant service for business websites.', 0.92),
+      c('pricing', 'AttachAI setup and pricing information for business websites.', 0.91),
+    ]);
+    expect(result.status).not.toBe('SUPPORTED');
+    expect(result.sufficient).toBe(false);
+  });
+
+  it('supports the documented service-intent question using multiple intent terms', () => {
+    const result = evaluateEvidence('What does AttachAI do?', [
+      c('overview', 'AttachAI Assistant is a personalized AI assistant service for individual business websites, configured around each business information.', 0.90),
+      c('pricing', 'AttachAI setup fee and pricing information.', 0.88),
+    ]);
+    expect(result.status).toBe('SUPPORTED');
+    expect(result.sufficient).toBe(true);
+  });
+
+  it('normalizes the known Roman-Hindi service-intent phrase', () => {
+    expect(normalizeRetrievalQuery('tum kya karte ho bhai')).toBe(
+      'what does this assistant do service business website',
+    );
+  });
+
     const result = selectFocusedEvidence([
       c('one', 'Pricing starts at £17.99 per month, subject to terms.', 0.90),
       c('two', 'Pricing starts at £17.99 per month, subject to terms.', 0.89),
